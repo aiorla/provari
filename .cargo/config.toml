@@ -1,0 +1,4 @@
+# Windows builds carry their C runtime, which not every Windows has, so that
+# the program needs no DLL but the system's own.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

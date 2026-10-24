@@ -1,0 +1,6 @@
+/target/
+# The network and the model that data/fetch.sh fetches and bundled builds carry
+/data/*
+!/data/fetch.sh
+# The browser build, from web/build.sh
+/web/dist/

@@ -1,0 +1,33 @@
+[package]
+name = "provari"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Prove forced Atomic wins and output them as checkable proofs"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+shakmaty = { version = "0.30.1", features = ["variant"] }
+shakmaty-syzygy = { version = "0.28.1", features = ["variant"] }
+serde_json = "1"
+zstd = { version = "0.13.3", default-features = false }
+
+[features]
+# Carries the network and the provability model in the program, from
+# data/network.nnue and data/model.json (which data/fetch.sh fetches), as
+# release binaries do.
+bundled = []
+
+[profile.release]
+debug = false
+codegen-units = 1
+lto = "fat"
+
+# Tests build in the dev profile, where unoptimized code turns shakmaty's
+# small functions into calls. Dependencies optimized, and our code lightly,
+# keep the suite at seconds with its overflow checks and debug assertions.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

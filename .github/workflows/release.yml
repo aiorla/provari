@@ -1,0 +1,75 @@
+# For a version's tag (v0.1.0, say), builds provari with its network and model
+# built in for Linux, macOS and Windows, and attaches the archives to a draft
+# release, to be checked and published by hand.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+env:
+  GH_TOKEN: ${{ github.token }}
+  PROVARI_NETWORKS: ${{ vars.PROVARI_NETWORKS }}
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag names Cargo.toml's version
+        run: test "$GITHUB_REF_NAME" = "v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+      - run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "provari $GITHUB_REF_NAME" --notes ""
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned, so that the C library the binary needs stays known.
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: macos-arm64
+          - os: windows-latest
+            platform: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update --no-self-update stable
+      - run: sh data/fetch.sh
+      - run: cargo build --release --locked --features bundled
+      - name: On Linux, glibc 2.34 or later, as the README says
+        if: runner.os == 'Linux'
+        run: |
+          needs=$(objdump -T target/release/provari | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)
+          echo "needs $needs"
+          test "$(printf '%s\n' "$needs" GLIBC_2.34 | sort -V | tail -n 1)" = GLIBC_2.34
+      - name: On Windows, no DLL of the C runtime, which .cargo/config.toml builds in
+        if: runner.os == 'Windows'
+        run: |
+          rustup component add llvm-tools
+          objdump=$(cygpath -u "$(rustc --print sysroot)")/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe
+          "$objdump" -p target/release/provari.exe | grep 'DLL Name' | tee dlls.txt
+          if grep -iE 'vcruntime|msvcp|ucrtbase|api-ms-win-crt' dlls.txt; then
+            echo "needs the C runtime's DLLs" >&2
+            exit 1
+          fi
+      - name: Package the binary with the license, the guide and the format
+        run: |
+          name=provari-$GITHUB_REF_NAME-${{ matrix.platform }}
+          mkdir "$name"
+          cp LICENSE README.md FORMAT.md "$name"/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/provari.exe "$name"/
+            "$name"/provari.exe --version | grep "built in"
+            7z a "$name.zip" "$name"
+            echo "archive=$name.zip" >> "$GITHUB_ENV"
+          else
+            cp target/release/provari "$name"/
+            "$name"/provari --version | grep "built in"
+            tar -czf "$name.tar.gz" "$name"
+            echo "archive=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - run: gh release upload "$GITHUB_REF_NAME" "$archive"

@@ -1,0 +1,25 @@
+# Checks and tests provari on Linux, macOS and Windows, with the network and
+# the model that data/fetch.sh fetches (from where the repository variable
+# PROVARI_NETWORKS says, if set).
+name: test
+on: [push, pull_request]
+env:
+  PROVARI_NETWORKS: ${{ vars.PROVARI_NETWORKS }}
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update --no-self-update stable
+      - run: sh data/fetch.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --features bundled --locked -- -D warnings
+      - run: cargo test --locked
