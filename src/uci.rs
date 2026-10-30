@@ -8,7 +8,13 @@
 //! until it settles the position or is stopped. A win is reported as engines
 //! report mates, with a longest line of its proof as the principal variation
 //! and its first move as the best move; without one the best move is the null
-//! move, 0000, and an `info string` says why.
+//! move, 0000, and an `info string` says why. While it searches, every
+//! second unless `--progress` says otherwise, it sends an `info` line with
+//! its time, nodes, speed and how full its proofs are, and as `currmove` the
+//! root move it has searched most; an `info string` with the root's proof
+//! number rebuilt from its line and that line in SAN, as `provari prove`'s
+//! status line shows them (`text`); and where the GUI turns UCI_ShowCurrLine
+//! on, the line as `currline`.
 
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
@@ -25,7 +31,7 @@ use provari::{
     STACK, board, dfpn::Dfpn, ending, format, lines, position, tablebase::Tablebase, walk,
 };
 
-use super::{Inputs, Options, parse, physical_mb};
+use super::{Inputs, Options, parse, physical_mb, text};
 
 /// Each search's memory in MB, its table and its proofs, unless `--memory` or
 /// `Hash` gives another.
@@ -64,7 +70,7 @@ type Out = Arc<dyn Fn(&str) + Send + Sync>;
 /// (`--memory`), `Threads` (`--threads`), `SyzygyPath` (`--tablebases`),
 /// `Attacker` (`--attacker`) and `Shorten` (`--shorten`) their defaults;
 /// `--progress S` is how often a search prints its progress, every second by
-/// default. Each search's budget comes from its `go`.
+/// default, 0 for never. Each search's budget comes from its `go`.
 pub fn run(args: &[String]) -> Result<(), String> {
     let (free, options) = parse(args)?;
     if !free.is_empty() {
@@ -97,6 +103,8 @@ struct Engine {
     syzygy: String,
     /// The position to search, or why the last `position` set up none.
     root: Result<Atomic, String>,
+    /// Whether searches send their line as `currline` (UCI_ShowCurrLine).
+    currline: bool,
     running: Option<Running>,
     out: Out,
 }
@@ -151,6 +159,7 @@ impl Engine {
             inputs: Arc::new(inputs),
             syzygy,
             root: Ok(Atomic::default()),
+            currline: false,
             running: None,
             out,
         }
@@ -228,6 +237,10 @@ impl Engine {
                 "option name Shorten type check default {}",
                 self.options.shorten
             ),
+            format!(
+                "option name UCI_ShowCurrLine type check default {}",
+                self.currline
+            ),
             "option name UCI_Variant type combo default atomic var atomic".to_owned(),
             "uciok".to_owned(),
         ] {
@@ -270,6 +283,11 @@ impl Engine {
                 "true" => self.options.shorten = true,
                 "false" => self.options.shorten = false,
                 _ => self.say(&format!("Shorten is true or false, not {value}")),
+            },
+            "uci_showcurrline" => match value.to_ascii_lowercase().as_str() {
+                "true" => self.currline = true,
+                "false" => self.currline = false,
+                _ => self.say(&format!("UCI_ShowCurrLine is true or false, not {value}")),
             },
             "uci_variant" if !value.eq_ignore_ascii_case("atomic") => {
                 self.say("provari proves Atomic wins only")
@@ -322,13 +340,15 @@ impl Engine {
         options.nodes = limits.nodes;
         options.most = limits.mate;
         options.progress = None;
+        let every = self.options.progress.unwrap_or(1.0);
         let job = Job {
             root: self.root.clone(),
             options,
             started,
             deadline: started + Duration::from_secs_f64(seconds),
             exact: limits.mate.is_some(),
-            every: Duration::from_secs_f64(self.options.progress.unwrap_or(1.0)),
+            every: (every > 0.0).then(|| Duration::from_secs_f64(every)),
+            currline: self.currline,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let hold = Arc::new(Hold::new(limits.infinite || limits.ponder));
@@ -478,8 +498,10 @@ struct Job {
     /// Under `go mate`, where the search plays tablebase wins out, its proofs
     /// need no tables, and their lengths are exact.
     exact: bool,
-    /// How often the search prints its progress.
-    every: Duration,
+    /// How often the search prints its progress, if at all.
+    every: Option<Duration>,
+    /// Whether it sends its line as `currline`.
+    currline: bool,
 }
 
 impl Job {
@@ -525,11 +547,18 @@ impl Job {
         // The GUI's clock runs from `go`, before the memory is set up.
         search.set_deadline(self.deadline);
         search.set_stop(stop);
-        let (progress_out, started) = (out.clone(), self.started);
-        search.set_progress_sink(
-            self.every,
-            Box::new(move |line| progress_out(&progress(line, started))),
-        );
+        let started = self.started;
+        if let Some(every) = self.every {
+            let (progress_out, from, currline) = (out.clone(), root.clone(), self.currline);
+            search.set_progress_sink(
+                every,
+                Box::new(move |record| {
+                    for line in progress(record, started, &from, attacker, currline) {
+                        progress_out(&line);
+                    }
+                }),
+            );
+        }
         let report = Report {
             root,
             attacker,
@@ -563,17 +592,44 @@ impl Job {
     }
 }
 
-/// A progress line, as UCI's info: the time since `go`, the nodes and their
-/// rate, and how full the proofs are, in thousandths.
-fn progress(line: &Value, started: Instant) -> String {
+/// A progress record, as UCI's info: the time since `go`, the nodes and their
+/// rate, how full the proofs are, in thousandths, and the root move searched
+/// most; then as an `info string`, the root's proof number and the line in
+/// SAN from `root`, as `provari prove`'s status line gives them; and with
+/// `currline`, the line in UCI's notation, as the first CPU's.
+fn progress(
+    record: &Value,
+    started: Instant,
+    root: &Atomic,
+    attacker: Color,
+    currline: bool,
+) -> Vec<String> {
     let ms = (started.elapsed().as_millis() as u64).max(1);
-    let nodes = line["nodes"].as_u64().unwrap_or_default();
-    let full = (line["proofs"].as_f64().unwrap_or_default() * 1000.0).round();
-    format!(
+    let nodes = record["nodes"].as_u64().unwrap_or_default();
+    let full = (record["proofs"].as_f64().unwrap_or_default() * 1000.0).round();
+    let mut info = format!(
         "info time {ms} nodes {nodes} nps {} hashfull {}",
         nodes * 1000 / ms,
         full.min(1000.0) as u64
-    )
+    );
+    if let Some(m) = record["most_searched"].as_str() {
+        info.push_str(&format!(" currmove {m}"));
+    }
+    let (numbers, plies) = text::progress(record, root, attacker);
+    let mut lines = vec![
+        info,
+        format!("info string {numbers}  {}", plies.join(" "))
+            .trim_end()
+            .to_owned(),
+    ];
+    let moves: Vec<&str> = record["line"]
+        .as_array()
+        .map(|line| line.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if currline && !moves.is_empty() {
+        lines.push(format!("info currline 1 {}", moves.join(" ")));
+    }
+    lines
 }
 
 /// How a search's wins are reported.
@@ -718,7 +774,7 @@ mod tests {
 
     use provari::dfpn::{Dfpn, Guide, split};
     use serde_json::json;
-    use shakmaty::{Color, Move, Position as _, uci::UciMove};
+    use shakmaty::{Color, Move, Position as _, san::SanPlus, uci::UciMove, variant::Atomic};
 
     use super::{Engine, Limits, Out, Report, Win};
     use crate::{Inputs, parse};
@@ -779,6 +835,7 @@ mod tests {
             "option name SyzygyPath type string default <empty>",
             "option name Attacker type combo default Mover var Mover var White var Black",
             "option name Shorten type check default false",
+            "option name UCI_ShowCurrLine type check default false",
             "option name UCI_Variant type combo default atomic var atomic",
         ] {
             assert!(lines.iter().any(|line| line == option), "{option}");
@@ -1015,6 +1072,7 @@ mod tests {
             "setoption name Threads value 0",
             "setoption name Attacker value red",
             "setoption name Shorten value maybe",
+            "setoption name UCI_ShowCurrLine value perhaps",
             "setoption name UCI_Variant value chess",
             "setoption name UCI_Variant value atomic",
             "setoption name Clear Hash",
@@ -1027,6 +1085,7 @@ mod tests {
                 "info string Threads is from 1 to 1024, not 0",
                 "info string the attacker is Mover, White or Black, not red",
                 "info string Shorten is true or false, not maybe",
+                "info string UCI_ShowCurrLine is true or false, not perhaps",
                 "info string provari proves Atomic wins only",
                 "info string provari has no option Clear Hash",
             ]
@@ -1059,5 +1118,71 @@ mod tests {
             (Some(7), Some(3), true)
         );
         assert_eq!(limits("infinite").seconds(Color::White), None);
+    }
+
+    /// While it searches, each progress line names the root move searched
+    /// most as `currmove`, an `info string` follows with the root's proof
+    /// number and the line in SAN, and with UCI_ShowCurrLine, `currline` with
+    /// the line; `--progress 0` sends none.
+    #[test]
+    fn reports_progress_while_it_searches() {
+        let run = |progress: &str, commands: &[&str]| {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let record = lines.clone();
+            let out: Out = Arc::new(move |line: &str| record.lock().unwrap().push(line.to_owned()));
+            let args = ["--memory", "16", "--progress", progress].map(str::to_owned);
+            let (_, options) = parse(&args).unwrap();
+            Engine::new(options, inputs(), out).serve(commands.iter().map(|c| (*c).to_owned()));
+            lines.lock().unwrap().clone()
+        };
+        // A report at most every 1,024 nodes.
+        let often = "0.000001";
+        let search = ["position startpos", "go nodes 20000"];
+        let lines = run(often, &search);
+        let progress = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|line| line.contains(" hashfull "))
+                .count()
+        };
+        let reports = progress(&lines);
+        let named = lines
+            .iter()
+            .filter(|line| line.contains(" currmove "))
+            .count();
+        assert!(reports >= 5 && named == reports, "{lines:?}");
+        let strings = lines
+            .iter()
+            .filter(|line| line.starts_with("info string pn ") && line.contains("  1. "))
+            .count();
+        assert_eq!(strings, reports, "{lines:?}");
+        assert!(!lines.iter().any(|line| line.starts_with("info currline")));
+        let shown = run(
+            often,
+            &[
+                "setoption name UCI_ShowCurrLine value true",
+                search[0],
+                search[1],
+            ],
+        );
+        let mut currlines = 0;
+        for (i, line) in shown.iter().enumerate() {
+            let Some(moves) = line.strip_prefix("info currline 1 ") else {
+                continue;
+            };
+            currlines += 1;
+            // The info string before it gives its line in SAN.
+            let root = Atomic::default();
+            let first = moves.split(' ').next().unwrap();
+            let m = first.parse::<UciMove>().unwrap().to_move(&root).unwrap();
+            let san = SanPlus::from_move(root, m);
+            assert!(
+                shown[i - 1].contains(&format!("  1. {san} ")),
+                "{} / {line}",
+                shown[i - 1]
+            );
+        }
+        assert_eq!(currlines, progress(&shown), "{shown:?}");
+        assert_eq!(progress(&run("0", &search)), 0);
     }
 }

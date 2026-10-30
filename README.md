@@ -47,20 +47,21 @@ provari prove 'r1b1kbnr/ppp3pp/n4q2/3pppN1/1P1PP3/8/P1P2PPP/RNBQKB1R w KQkq - 0 
 
 searches the position for up to 10 seconds and prints:
 
-```json
-{"first_mate_ms":240,"found":true,"mate":13,"memory_mb":192,"ms":277,"nodes":169485,"proof_moves":936,"seconds":10.0}
+```
+White mates in 13, found in 240 ms and 169k nodes.
+Longest line: 1. dxe5 Nf6 2. exd5 Bd6 3. Bb5+ Nxb4 4. Qe2+ Be5 5. f4 Ng4 6. fxe5+ Ne5 7. Qh5+ g6 8. Qh6 Nd3+ 9. cxd3 Kd8 10. Ne6+ Bxe6 11. Qg5+ Kd7 12. Qe7+ Kc6 13. Qxc7#
+Proof written to win.pvr (936 moves).
 ```
 
-White wins in 13 moves. The search found the win after 0.24 seconds, and the
-proof is in `win.pvr`. Then:
+White wins in 13 moves, and the proof is in `win.pvr`. Then:
 
 ```sh
 provari check win.pvr
 provari line win.pvr
 ```
 
-verify the proof, printing `"valid":true`, and show its lines, from
-`1. dxe5 Nf6 2. exd5 Bd6` to the mate, `13. Qxc7#`.
+verify the proof, printing `"valid":true`, and show every defence to
+`1. dxe5` with the moves it lasts.
 
 In the Windows Command Prompt, quote the FEN with double quotes.
 
@@ -85,11 +86,34 @@ position that the tablebases score as won. provari follows Lichess's Atomic
 rules with the 50-move rule, and one rule of its own: no line of a proof may
 repeat a position. Any win counts; `--shorten` looks for shorter ones.
 
-`provari prove` prints a line of JSON: whether it `found` a win, the win's
-length in moves (`mate`), the nodes searched, the time taken, and the budgets
-it had. If the game is already over, it says how it ended (`over`, `winner`)
-instead. If something goes wrong, such as a bad FEN or a proof it cannot
-write, it says what (`error`) and exits with 2.
+`provari prove` says what it found: a win with its length and a longest line,
+or that there is none, or, when its budget runs out first, the line the search
+was on, the hardest it met. If the game is already over, it says how it ended.
+If something goes wrong, such as a bad FEN or a proof it cannot write, it says
+what on standard error and exits with 2.
+
+While it searches on a terminal, a status line, rewritten every second, shows
+how it is going:
+
+```
+  4 s   836k nodes   181k/s  pn 2.1k, closing in    1. d6 (3 left) Bg7 2. dxc7 (1 left) d5
+```
+
+the time, the nodes searched and their speed, the proof number (`pn`, how
+much work the search reckons a proof still needs), and the line it is on, with
+the defences not yet beaten after each attacker move. The proof number shows
+its peak, `pn 7.1k (peak 7.4k)`, until it falls below half of it: then
+`closing in`, a sign that a proof may be near, though no promise.
+
+With `--json`, for programs, it prints a line of JSON instead: whether it
+`found` a win, the win's length in moves (`mate`), the nodes searched, the
+time taken, and the budgets it had; without a win, the root's proof and
+disproof numbers (`root`). A game already over has `over` and `winner`, and
+an error `error`. `--progress S` then prints a JSON line every S seconds on
+standard error with the status line's numbers and more, and a search cut
+short gives its line (`line`, in UCI notation) with the moves still open
+where each was played (`open`). Keeping that line costs some time, so
+without `--progress` a search keeps none.
 
 | Option | Default | What it does |
 |---|---|---|
@@ -105,7 +129,8 @@ write, it says what (`error`) and exits with 2.
 | `--proofs PATH` | none | Where to write the proof (for `bench`, a folder). |
 | `--out PATH` | | Where `bench` and `convert` write. |
 | `--workers N` | 1 | Searches, checks or conversions at a time. |
-| `--progress S` | none | Prints how a search is going every S seconds. |
+| `--progress S` | 1 for the status line, else none | How often a search reports its progress, in seconds; 0 for never. |
+| `--json` | off | Prints the result, and the progress, as JSON. |
 | `--guide model\|network\|hand\|none` | the strongest available | What guides the search. |
 | `--model FILE`, `--network FILE` | built in | Another model or network. |
 | `--no-eval` | | The same as `--guide none`. |
@@ -147,7 +172,11 @@ searches for a win as `provari prove` does, limited by `mate N`, `nodes`,
 `movetime` or the clock, or with `infinite` until `stop`. A win is reported
 as a mate (`score mate N`), or as a tablebase win (`score cp`, 20000 less the
 line's plies) when its lines may end in the tablebases. Without a win the
-best move is `0000`, and an `info string` says why.
+best move is `0000`, and an `info string` says why. While it searches, every
+second (`--progress S`), it sends the time, the nodes, their speed, how full
+its memory is, and the root move it has searched most (`currmove`); then the
+proof number and the line as `provari prove` shows them, in an
+`info string`; and with `UCI_ShowCurrLine`, the line itself (`currline`).
 
 | Option | Default | What it does |
 |---|---|---|
@@ -156,6 +185,7 @@ best move is `0000`, and an `info string` says why.
 | `SyzygyPath` | empty | The tablebases' folders. |
 | `Attacker` | `Mover` | Whose win to search for: `Mover`, `White` or `Black`. |
 | `Shorten` | false | After a win, looks for shorter ones and reports each. |
+| `UCI_ShowCurrLine` | false | Sends the line being searched (`currline`). |
 | `UCI_Variant` | `atomic` | `atomic` only. |
 
 ## Proofs

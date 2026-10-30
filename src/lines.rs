@@ -505,7 +505,7 @@ impl Lines<'_> {
 
 /// Plays a move and writes it in SAN, numbered as PGN numbers it: always for
 /// White, for Black where `numbered`.
-fn play(pos: &mut Atomic, m: Move, numbered: bool) -> String {
+pub fn play(pos: &mut Atomic, m: Move, numbered: bool) -> String {
     let number = pos.fullmoves().get();
     let white = pos.turn().is_white();
     let san = SanPlus::from_move_and_play_unchecked(pos, m);

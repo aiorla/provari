@@ -18,8 +18,12 @@
 //! memory, or the prover refuses to start. `--threads N` searches each
 //! position with N threads that share its memory, its default sized for N
 //! times the nodes in the time, and spread out over the tree so that each
-//! takes a line of its own (`dfpn`). `--progress SECONDS` prints how a
-//! search goes that often. Results report the budgets a search had. The
+//! takes a line of its own (`dfpn`). `provari prove` prints for people
+//! (`text`): a status line while it searches, every second where standard
+//! error is a terminal, and its result in words; `--json` prints its result
+//! as a line of JSON for programs, as `bench` always does. `--progress
+//! SECONDS` reports how a search goes that often, 0 for never, in JSON lines
+//! for `--json` and `bench`. Results report the budgets a search had. The
 //! strongest evaluation there is guides the search: a provability model
 //! (`--model FILE`), else Atomic-Stockfish's network (`--network FILE`), else
 //! a hand-crafted one; release builds carry a network and a model (`BUNDLED`)
@@ -52,6 +56,7 @@ use dfpn::{Dfpn, Guide};
 use search::{Search, read_proof};
 use tablebase::Tablebase;
 
+mod text;
 mod uci;
 
 /// The time a search has when given neither `--seconds` nor `--nodes`.
@@ -79,8 +84,14 @@ struct Options {
     /// The most memory the searches together may take, in MB, if not half
     /// the machine's.
     max_memory: Option<usize>,
-    /// Seconds between progress lines, for a df-pn search; none by default.
+    /// Seconds between progress lines, for a df-pn search, 0 for none; by
+    /// default none, but for `prove`'s status line on a terminal.
     progress: Option<f64>,
+    /// `prove` prints its result as JSON, for programs.
+    json: bool,
+    /// Where `prove`'s searches print their status lines, if they do: for
+    /// people, where `--json` is not given. Not an option.
+    status: Option<text::Status>,
     /// After a win, looks for shorter ones within the same budget.
     shorten: bool,
     /// The share of their room at which the proofs drop their mates in one,
@@ -195,6 +206,8 @@ Main options:
   --proofs PATH            where prove writes its proof (bench: a folder)
   --out PATH               where bench and convert write
   --workers N              searches or checks at a time
+  --progress S             reports a search's progress every S seconds
+  --json                   prove's result as JSON, for programs
 
 README.md explains every command and option:
 https://github.com/aiorla/provari
@@ -212,6 +225,8 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
         memory: None,
         max_memory: None,
         progress: None,
+        json: false,
+        status: None,
         shorten: false,
         drop_mates_at: None,
         tablebases: None,
@@ -243,9 +258,12 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
             "--max-memory" => {
                 options.max_memory = Some(value()?.parse().map_err(|_| "bad --max-memory")?)
             }
-            "--progress" => {
-                options.progress = Some(value()?.parse().map_err(|_| "bad --progress")?)
-            }
+            // At most a billion seconds, which a clock can add to its time.
+            "--progress" => match value()?.parse() {
+                Ok(seconds) if (0.0..=1e9).contains(&seconds) => options.progress = Some(seconds),
+                _ => return Err("--progress takes seconds, 0 for none".into()),
+            },
+            "--json" => options.json = true,
             "--workers" => options.workers = value()?.parse().map_err(|_| "bad --workers")?,
             "--tablebases" => options.tablebases = Some(value()?.into()),
             "--network" => options.network = Some(value()?.into()),
@@ -531,8 +549,18 @@ impl Inputs {
         if let Some(most) = options.most {
             search.set_most(most);
         }
-        if let Some(seconds) = options.progress {
-            search.set_progress(Duration::from_secs_f64(seconds));
+        // People are shown the line a search cut short stopped on, which a
+        // search keeps only when asked, as it costs time.
+        match &options.status {
+            Some(status) => match status.every {
+                Some(every) => search.set_progress_sink(every, status.sink(root.clone(), attacker)),
+                None => search.keep_line(),
+            },
+            None => {
+                if let Some(seconds) = options.progress.filter(|&seconds| seconds > 0.0) {
+                    search.set_progress(Duration::from_secs_f64(seconds));
+                }
+            }
         }
         search.set_seed(options.seed);
         if let Some(share) = options.drop_mates_at {
@@ -576,77 +604,109 @@ fn run(
         }
     }
     let tablebase = inputs.tablebase.as_ref();
+    // People are shown a win's longest line.
+    let longest = options.status.is_some();
     let mut started = Instant::now();
     let mut shortened = None;
-    let (moves, first_ms, nodes, (full, dropped), root_numbers, written) = if options.search
-        == "exhaustive"
-    {
-        // The baseline has no node budget: only a time limit.
-        let seconds = options.seconds.unwrap_or(DEFAULT_SECONDS);
-        let deadline = started + Duration::from_secs_f64(seconds);
-        // The baseline keeps no proofs apart: its table takes the table's
-        // share.
-        let entries = options.memory().0 << 20 >> 5;
-        let mut search = Search::new(&root, tablebase, deadline, entries);
-        let moves = search.solve(&root, options.most.unwrap_or(60));
-        let first_ms = started.elapsed().as_millis() as u64;
-        let written = moves.map(|moves| {
-            write_proof(&root, attacker, fen, moves, tablebase, proof, |_, key| {
-                search.winning_move(key)
-            })
-        });
-        (moves, first_ms, search.nodes, (false, None), None, written)
-    } else {
-        let mut search = inputs.search(&root, attacker, options);
-        // The clock and the time limit start once the search's memory is set
-        // up, as an engine's do at `go`, after its hash is ready.
-        started = Instant::now();
-        search.set_deadline(options.deadline());
-        let mut moves = search.solve(&root);
-        let first_ms = started.elapsed().as_millis() as u64;
-        if options.shorten
-            && let Some(length) = moves
-        {
-            // The first win as written, which can already be shorter than
-            // the search's own length, as the walk takes each position's
-            // shortest proof.
-            let first = write_proof(&root, attacker, fen, length, tablebase, None, |pos, key| {
-                search.winning_move(pos, key)
-            })
-            .map_or(length, |written| written.length);
-            let mut done = Shortened {
-                first,
-                first_ms,
-                first_nodes: search.nodes,
-                passes: 0,
-                ms: first_ms,
-                nodes: search.nodes,
-                shortest: false,
-            };
-            let shortening = search.shorten(&root, length, |search, _| {
-                done.ms = started.elapsed().as_millis() as u64;
-                done.nodes = search.nodes;
+    let (moves, first_ms, nodes, (full, dropped), root_numbers, written, hardest) =
+        if options.search == "exhaustive" {
+            // The baseline has no node budget: only a time limit.
+            let seconds = options.seconds.unwrap_or(DEFAULT_SECONDS);
+            let deadline = started + Duration::from_secs_f64(seconds);
+            // The baseline keeps no proofs apart: its table takes the table's
+            // share.
+            let entries = options.memory().0 << 20 >> 5;
+            let mut search = Search::new(&root, tablebase, deadline, entries);
+            let moves = search.solve(&root, options.most.unwrap_or(60));
+            let first_ms = started.elapsed().as_millis() as u64;
+            let written = moves.map(|moves| {
+                write_proof(
+                    &root,
+                    attacker,
+                    fen,
+                    moves,
+                    tablebase,
+                    proof,
+                    longest,
+                    |_, key| search.winning_move(key),
+                )
             });
-            done.passes = shortening.passes;
-            done.shortest = shortening.shortest;
-            moves = Some(shortening.length);
-            shortened = Some(done);
-        }
-        let written = moves.map(|moves| {
-            write_proof(&root, attacker, fen, moves, tablebase, proof, |pos, key| {
-                search.winning_move(pos, key)
-            })
-        });
-        let full = (search.proofs_full(), search.mates_dropped);
-        (
-            moves,
-            first_ms,
-            search.nodes,
-            full,
-            search.root_numbers,
-            written,
-        )
-    };
+            (
+                moves,
+                first_ms,
+                search.nodes,
+                (false, None),
+                None,
+                written,
+                None,
+            )
+        } else {
+            let mut search = inputs.search(&root, attacker, options);
+            // The clock and the time limit start once the search's memory is set
+            // up, as an engine's do at `go`, after its hash is ready.
+            started = Instant::now();
+            search.set_deadline(options.deadline());
+            let mut moves = search.solve(&root);
+            let first_ms = started.elapsed().as_millis() as u64;
+            if options.shorten
+                && let Some(length) = moves
+            {
+                // The first win as written, which can already be shorter than
+                // the search's own length, as the walk takes each position's
+                // shortest proof.
+                let first = write_proof(
+                    &root,
+                    attacker,
+                    fen,
+                    length,
+                    tablebase,
+                    None,
+                    false,
+                    |pos, key| search.winning_move(pos, key),
+                )
+                .map_or(length, |written| written.length);
+                let mut done = Shortened {
+                    first,
+                    first_ms,
+                    first_nodes: search.nodes,
+                    passes: 0,
+                    ms: first_ms,
+                    nodes: search.nodes,
+                    shortest: false,
+                };
+                let shortening = search.shorten(&root, length, |search, _| {
+                    done.ms = started.elapsed().as_millis() as u64;
+                    done.nodes = search.nodes;
+                });
+                done.passes = shortening.passes;
+                done.shortest = shortening.shortest;
+                moves = Some(shortening.length);
+                shortened = Some(done);
+            }
+            let written = moves.map(|moves| {
+                write_proof(
+                    &root,
+                    attacker,
+                    fen,
+                    moves,
+                    tablebase,
+                    proof,
+                    longest,
+                    |pos, key| search.winning_move(pos, key),
+                )
+            });
+            let full = (search.proofs_full(), search.mates_dropped);
+            let hardest = moves.is_none().then(|| search.line());
+            (
+                moves,
+                first_ms,
+                search.nodes,
+                full,
+                search.root_numbers,
+                written,
+                hardest,
+            )
+        };
     let elapsed = started.elapsed().as_millis() as u64;
     // The length of the proof as written: the compact format settles some
     // positions by their quickest win, so it can be shorter than the
@@ -705,10 +765,39 @@ fn run(
             result["refuted"] = json!(true);
         }
     }
+    // Cut short, the line the search stopped on, the hardest it met, with
+    // the moves still open along it, where the search kept it: while it
+    // reported, or for people (`Dfpn::line`).
+    if let Some((line, open)) = hardest
+        && !line.is_empty()
+        && result.get("refuted").is_none()
+    {
+        result["line"] = json!(line);
+        result["open"] = json!(open);
+    }
     match written {
-        Some(Ok(written)) if proof.is_some() => result[written.field] = json!(written.count),
+        Some(Ok(written)) => {
+            if proof.is_some() {
+                result[written.field] = json!(written.count);
+            }
+            // For people: a longest line, and whether lines may end at
+            // tablebase wins, which makes the length a bound.
+            if let Some((line, at_table)) = written.longest {
+                let line: Vec<String> = line
+                    .into_iter()
+                    .map(|m| UciMove::from_standard(m).to_string())
+                    .collect();
+                result["line"] = json!(line);
+                if at_table {
+                    result["line_tablebase"] = json!(true);
+                }
+                if written.tablebases {
+                    result["tablebases"] = json!(true);
+                }
+            }
+        }
         Some(Err(error)) => result["error"] = json!(error),
-        _ => {}
+        None => {}
     }
     result
 }
@@ -727,12 +816,15 @@ struct Shortened {
     shortest: bool,
 }
 
-/// A proof read back: its length as written, and the result field for its
-/// size, with the size.
+/// A proof read back: its length as written, the result field for its size,
+/// with the size, whether lines may end at tablebase wins, and a longest
+/// line, with whether it ends at one, if asked for.
 struct Written {
     length: u32,
     field: &'static str,
     count: usize,
+    tablebases: bool,
+    longest: Option<(Vec<shakmaty::Move>, bool)>,
 }
 
 /// Whether a proof file is in JSON lines, by its name; any other is compact.
@@ -747,7 +839,8 @@ fn is_jsonl(path: &Path) -> bool {
 /// line for the root and one for each attacker position, through a temporary
 /// file so that a proof there is always whole. Returns its length as written
 /// and its size: the moves a compact proof writes, the positions JSON lines
-/// list.
+/// list; with `longest`, a longest line of it too (`lines`).
+#[allow(clippy::too_many_arguments)]
 fn write_proof(
     root: &Atomic,
     attacker: Color,
@@ -755,6 +848,7 @@ fn write_proof(
     moves: u32,
     tablebase: Option<&Tablebase>,
     path: Option<&Path>,
+    longest: bool,
     mut winning_move: impl FnMut(&Atomic, &search::Key) -> Option<shakmaty::Move>,
 ) -> Result<Written, String> {
     if path.is_none_or(|path| !is_jsonl(path)) {
@@ -765,10 +859,19 @@ fn write_proof(
         if let Some(path) = path {
             format::save(path, &format::file(&header, &indices)?)?;
         }
+        let longest = match longest {
+            true => {
+                let (_, _, moves) = format::strategy(&header, &indices, tablebase)?;
+                Some(lines::Proof::new(attacker, moves).longest_line(root, tablebase)?)
+            }
+            false => None,
+        };
         return Ok(Written {
             length: header.moves,
             field: "proof_moves",
             count: header.positions as usize,
+            tablebases: header.tablebases > 0,
+            longest,
         });
     }
     let error = |error: std::io::Error| format!("cannot write the proof: {error}");
@@ -780,7 +883,12 @@ fn write_proof(
     if let Some(out) = &mut out {
         writeln!(out, "{}", json!({ "root": fen, "moves": moves })).map_err(error)?;
     }
+    let (mut strategy, mut tablebases) = (walk::Moves::new(), false);
     let positions = read_proof(root, tablebase, winning_move, |pos, m| {
+        tablebases |= m.is_none();
+        if longest {
+            strategy.entry(search::hash(pos)).or_insert(m);
+        }
         let Some(out) = &mut out else {
             return Ok(());
         };
@@ -796,10 +904,16 @@ fn write_proof(
             .map_err(|failed| error(failed.into_error()))?;
         fs::rename(partial, path).map_err(error)?;
     }
+    let longest = match longest {
+        true => Some(lines::Proof::new(attacker, strategy).longest_line(root, tablebase)?),
+        false => None,
+    };
     Ok(Written {
         length: moves,
         field: "proof_positions",
         count: positions,
+        tablebases,
+        longest,
     })
 }
 
@@ -885,12 +999,17 @@ fn evaluate(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Searches one position and prints its result. Returns whether the result
-/// holds no error, such as a bad FEN or a proof that could not be written.
+/// Searches one position and prints its result, for people (`text`), or with
+/// `--json` as JSON. Returns whether the result holds no error, such as a bad
+/// FEN or a proof that could not be written, which people read on standard
+/// error.
 fn prove(args: &[String]) -> Result<bool, String> {
-    let (free, options) = parse(args)?;
+    let (free, mut options) = parse(args)?;
     options.check_memory(1)?;
     let fen = free.join(" ");
+    if !options.json {
+        options.status = Some(text::Status::new(options.progress));
+    }
     let inputs = Inputs::open(&options, true)?;
     let proof = options.proofs.clone();
     let result = std::thread::scope(|scope| {
@@ -903,8 +1022,28 @@ fn prove(args: &[String]) -> Result<bool, String> {
             .join()
             .expect("the search failed")
     });
-    println!("{result}");
-    Ok(result.get("error").is_none())
+    let Some(status) = &options.status else {
+        println!("{result}");
+        return Ok(result.get("error").is_none());
+    };
+    status.clear();
+    if let Ok(root) = position(&fen) {
+        let attacker = options.attacker.unwrap_or(root.turn());
+        let path = proof.as_ref().map(|path| path.display().to_string());
+        let said = text::result(&result, &root, attacker, path.as_deref());
+        // An error before the search, such as an attacker it refuses, says
+        // nothing else.
+        if !said.is_empty() {
+            println!("{said}");
+        }
+    }
+    match result["error"].as_str() {
+        Some(error) => {
+            eprintln!("error: {error}");
+            Ok(false)
+        }
+        None => Ok(true),
+    }
 }
 
 /// Searches each position of a JSONL benchmark and appends a result for each.
@@ -1292,6 +1431,77 @@ mod tests {
         assert!(error.ends_with("line 2: no id, as a string"), "{error}");
         assert_eq!(results(), 2);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A search cut short tells the line it stopped on, with the moves open
+    /// along it, where it kept it: while it reported, or for people; a
+    /// refuted one does not. Shown to people, a win gives a longest line, one
+    /// move for a mate in one.
+    #[test]
+    fn tells_the_line_a_search_stopped_on() {
+        let args =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|arg| (*arg).to_owned()).collect() };
+        let inputs = Inputs {
+            tablebase: None,
+            network: None,
+            model: None,
+        };
+        let people = Some(super::text::Status {
+            every: None,
+            terminal: false,
+        });
+        let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        let budget = ["--nodes", "5000", "--memory", "16"];
+        let (_, options) = parse(&args(&budget)).unwrap();
+        let quiet = run(start, None, &options, &inputs, None);
+        assert!(quiet.get("line").is_none(), "{quiet}");
+        // Reporting, though never in so few nodes, or for people.
+        let (_, reporting) =
+            parse(&args(&[&budget[..], &["--progress", "1000"]].concat())).unwrap();
+        let mut shown = options.clone();
+        shown.status = people.clone();
+        for options in [reporting, shown] {
+            let cut = run(start, None, &options, &inputs, None);
+            let (line, open) = (
+                cut["line"].as_array().unwrap(),
+                cut["open"].as_array().unwrap(),
+            );
+            assert!(!line.is_empty() && line.len() == open.len(), "{cut}");
+            assert_eq!(cut["nodes"], quiet["nodes"]);
+        }
+        let (_, mut options) = parse(&args(&["--nodes", "5000", "--most", "1"])).unwrap();
+        options.status = people.clone();
+        let refuted = run(start, None, &options, &inputs, None);
+        assert_eq!(refuted["refuted"], true);
+        assert!(refuted.get("line").is_none(), "{refuted}");
+        let mate = "4k3/3p4/8/8/8/8/8/3QK3 w - - 0 1";
+        let (_, mut options) = parse(&args(&["--nodes", "1000"])).unwrap();
+        assert!(
+            run(mate, None, &options, &inputs, None)
+                .get("line")
+                .is_none()
+        );
+        options.status = people;
+        let shown = run(mate, None, &options, &inputs, None);
+        assert_eq!(shown["line"], json!(["d1d7"]), "{shown}");
+    }
+
+    /// `--progress` takes seconds, 0 for none, and `--json` asks for JSON.
+    #[test]
+    fn reads_progress_and_json() {
+        let parsed = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            parse(&args).map(|(_, options)| (options.progress, options.json))
+        };
+        assert_eq!(parsed(&[]), Ok((None, false)));
+        assert_eq!(
+            parsed(&["--progress", "0", "--json"]),
+            Ok((Some(0.0), true))
+        );
+        assert_eq!(parsed(&["--progress", "0.5"]), Ok((Some(0.5), false)));
+        for bad in ["-1", "NaN", "inf", "soon"] {
+            assert!(parsed(&["--progress", bad]).is_err(), "{bad}");
+        }
     }
 
     /// The help lists every command, in lines of at most 80 characters.

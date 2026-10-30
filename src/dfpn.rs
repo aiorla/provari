@@ -64,6 +64,18 @@
 //! stops the others. Dropping the mates in one and rebuilding the table's
 //! filter move what every thread reads, so one thread makes them while the
 //! others wait (`pause`).
+//!
+//! A search can report how it goes (`set_progress`): besides its nodes, its
+//! line, the first plies of the path it is on, which is the attacker's
+//! cheapest move, the defender's likeliest refutation, and so on; the moves
+//! still open where each was played, for the defender the defences not yet
+//! beaten; the root move searched most; and the root's numbers rebuilt from
+//! the line. The root's own are combined only when the search comes back to
+//! it, which it may not do for millions of nodes, so each level of the line
+//! keeps its other children's numbers as it last combined them, and a report
+//! combines them again from the bottom up. That costs some 1.5% of a
+//! search's time, so a search keeps its line only while it reports, or when
+//! asked (`keep_line`).
 
 use std::cmp::Reverse;
 use std::collections::TryReserveError;
@@ -73,7 +85,7 @@ use std::time::Duration;
 
 use crate::clock::Instant;
 
-use shakmaty::{Color, variant::Atomic};
+use shakmaty::{Color, uci::UciMove, variant::Atomic};
 
 use crate::board::{Effect, Move, Position};
 use crate::model::{FEATURES, Model};
@@ -131,6 +143,9 @@ const MAGNITUDE: f32 = 0.25;
 const DECISIVE: i32 = 5 * 208;
 const HAND_DECISIVE: i32 = 500;
 
+/// The plies of its line a search keeps for its progress lines.
+const LINE: usize = 16;
+
 /// What spreads a seed over all bits (`set_seed`).
 const SEED_SPREAD: u64 = 0xD1B5_4A32_D192_ED03;
 /// The bits of a position's hash that pick its slot among the threads' marks
@@ -184,6 +199,21 @@ struct Progress {
     sink: Option<ProgressSink>,
 }
 
+/// A position on the search's line, as it was when the search last chose
+/// its move there: the move, whether the attacker's, the child's numbers
+/// then, the other children's deciding numbers at their least and the
+/// others summed (attacking, proof and disproof numbers; defending, the
+/// other way round), and the children still open, the chosen one among them.
+#[derive(Clone, Copy, Default)]
+struct Level {
+    m: Move,
+    attacking: bool,
+    taken: Numbers,
+    least: u32,
+    sum: u32,
+    open: u32,
+}
+
 /// Positions a search expands near its root, kept at random for labelling.
 pub struct Sampler {
     pub max_depth: usize,
@@ -228,7 +258,7 @@ impl Sampler {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Numbers {
     proof: u32,
     disproof: u32,
@@ -431,6 +461,18 @@ pub struct Dfpn<'a> {
     progress: Option<Progress>,
     /// The root's proof and disproof numbers as the search last combined them.
     root: (u32, u32),
+    /// Whether the search keeps its line and its root moves' nodes: while it
+    /// reports, or when asked (`keep_line`).
+    keeping: bool,
+    /// The first `LINE` plies of the search's line, `line_len` of them
+    /// current, from `line_root` (`Level`).
+    levels: [Level; LINE],
+    line_len: usize,
+    line_root: Option<Position>,
+    /// This thread's nodes below each root move searched.
+    root_moves: Vec<(Move, u64)>,
+    /// The highest root proof number a progress line has reported.
+    peak: u32,
     /// The perturbation's seed, spread over all bits; 0 for none.
     seed: u64,
     /// The most attacker moves a win may take, if limited.
@@ -547,6 +589,12 @@ impl<'a> Dfpn<'a> {
             drop_mates_at: settings.drop_mates_at,
             progress: None,
             root: (1, 1),
+            keeping: false,
+            levels: [Level::default(); LINE],
+            line_len: 0,
+            line_root: None,
+            root_moves: Vec::new(),
+            peak: 0,
             seed: 0,
             most: settings.most,
             root_attacking: settings.root_attacking,
@@ -609,9 +657,11 @@ impl<'a> Dfpn<'a> {
         self.most = Some(moves);
     }
 
-    /// Prints a progress line every `every` (see `report`).
+    /// Prints a progress line every `every` (see `report`), keeping the
+    /// search's line for it.
     pub fn set_progress(&mut self, every: Duration) {
         let now = Instant::now();
+        self.keeping = true;
         self.progress = Some(Progress {
             every,
             next: now + every,
@@ -630,8 +680,17 @@ impl<'a> Dfpn<'a> {
         }
     }
 
+    /// Keeps the search's line without reporting it, for `line` once the
+    /// search stops.
+    pub fn keep_line(&mut self) {
+        self.keeping = true;
+    }
+
     /// How many attacker moves the proven win takes, if one is found in time.
     pub fn solve(&mut self, root: &Atomic) -> Option<u32> {
+        self.line_len = 0;
+        self.root_moves.clear();
+        self.peak = 0;
         // The search settles a position that has ended before reaching it;
         // a root that has ended, such as a sampled defender position, is
         // settled here, for the attacker as set.
@@ -649,6 +708,7 @@ impl<'a> Dfpn<'a> {
         }
         self.root_attacking = shakmaty::Position::turn(root) == self.attacker;
         let root = Position::from_atomic(root);
+        self.line_root = Some(root.clone());
         let numbers = if self.together {
             self.search_together(&root)
         } else {
@@ -893,6 +953,9 @@ impl<'a> Dfpn<'a> {
                     disproof_limit.min(widen(second)),
                 )
             };
+            if self.keeping && (depth as usize) < LINE {
+                self.keep_level(depth as usize, attacking, &children, best);
+            }
             let next = pos.play(children[best].m);
             debug_assert_eq!(next.hash(), children[best].hash);
             // Together, the other threads see this one below the child while
@@ -901,9 +964,13 @@ impl<'a> Dfpn<'a> {
             if let Some(slot) = busy {
                 self.store.busy[slot].fetch_add(1, Relaxed);
             }
+            let before = self.nodes;
             let value = self.mid(&next, child_proof, child_disproof);
             if let Some(slot) = busy {
                 self.store.busy[slot].fetch_sub(1, Relaxed);
+            }
+            if self.keeping && depth == 0 {
+                self.searched(children[best].m, self.nodes - before);
             }
             children[best].value = value;
             // A defence just proven may prove its siblings too: replay its
@@ -2420,15 +2487,118 @@ impl<'a> Dfpn<'a> {
         }
     }
 
-    /// Prints a line on how the search goes, to standard error: the seconds
-    /// and nodes so far, the nodes a second since the last line, the root's
-    /// proof and disproof numbers, the share of the table's slots taken (from
-    /// a sample), how full the proofs are, 1 being where they fill, and the
-    /// nodes searched when they dropped their mates in one, once they have.
-    fn report(&mut self, now: Instant) {
-        let Some(progress) = &mut self.progress else {
-            return;
+    /// Keeps a level of the search's line (`Level`), at `depth`, before the
+    /// search descends into its chosen child.
+    fn keep_level(&mut self, depth: usize, attacking: bool, children: &[Child], best: usize) {
+        let mut level = Level {
+            m: children[best].m,
+            attacking,
+            taken: children[best].value.numbers,
+            least: INFINITY,
+            sum: 0,
+            open: 0,
         };
+        for (index, child) in children.iter().enumerate() {
+            let numbers = child.value.numbers;
+            level.open += u32::from(numbers.proof != 0 && numbers.disproof != 0);
+            if index == best {
+                continue;
+            }
+            let (deciding, summed) = if attacking {
+                (numbers.proof, numbers.disproof)
+            } else {
+                (numbers.disproof, numbers.proof)
+            };
+            level.least = level.least.min(deciding);
+            level.sum = level.sum.saturating_add(summed);
+        }
+        self.levels[depth] = level;
+        self.line_len = depth + 1;
+    }
+
+    /// Counts `nodes` searched below the root move `m`.
+    fn searched(&mut self, m: Move, nodes: u64) {
+        match self.root_moves.iter_mut().find(|(known, _)| *known == m) {
+            Some((_, searched)) => *searched += nodes,
+            None => self.root_moves.push((m, nodes)),
+        }
+    }
+
+    /// The root's numbers now, rebuilt from the line: the deepest level's
+    /// chosen child as it was chosen, and at each level above, the numbers
+    /// below combined with the other children's, as `combine` does. Without
+    /// a line, as the root last combined them.
+    fn root_now(&self) -> (u32, u32) {
+        let mut below: Option<Numbers> = None;
+        for level in self.levels[..self.line_len].iter().rev() {
+            let child = below.unwrap_or(level.taken);
+            // A sum of open children's numbers stays short of infinity, which
+            // would read as settled.
+            let sum = |number: u32| level.sum.saturating_add(number).min(INFINITY - 1);
+            below = Some(if level.attacking {
+                Numbers {
+                    proof: level.least.min(child.proof),
+                    disproof: sum(child.disproof),
+                }
+            } else {
+                Numbers {
+                    proof: sum(child.proof),
+                    disproof: level.least.min(child.disproof),
+                }
+            });
+        }
+        below.map_or(self.root, |numbers| (numbers.proof, numbers.disproof))
+    }
+
+    /// The search's line, its first `LINE` plies at most, in UCI's notation,
+    /// with the moves still open where each was played: for the defender,
+    /// the defences not yet beaten; for the attacker, the moves not yet
+    /// refuted, its quiet moves counted as one until the search opens them
+    /// (`open_group`). When the search has stopped, the line it was on.
+    /// Empty unless the search keeps its line (`keep_line`).
+    pub fn line(&self) -> (Vec<String>, Vec<u32>) {
+        let levels = &self.levels[..self.line_len];
+        let Some(mut pos) = self.line_root.clone() else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut moves = Vec::with_capacity(levels.len());
+        for level in levels {
+            moves.push(UciMove::from_standard(pos.to_shakmaty(level.m)).to_string());
+            pos = pos.play(level.m);
+        }
+        (moves, levels.iter().map(|level| level.open).collect())
+    }
+
+    /// The root move this thread has searched the most nodes below, in UCI's
+    /// notation.
+    fn most_searched(&self) -> Option<String> {
+        let root = self.line_root.as_ref()?;
+        let &(m, _) = self
+            .root_moves
+            .iter()
+            .rev()
+            .max_by_key(|(_, nodes)| *nodes)?;
+        Some(UciMove::from_standard(root.to_shakmaty(m)).to_string())
+    }
+
+    /// Prints a line on how the search goes, as JSON to standard error, or
+    /// hands it to the sink: the seconds and nodes so far, the nodes a second
+    /// since the last line, the root's proof and disproof numbers rebuilt
+    /// from the line (`root_now`), the highest proof number reported so far
+    /// (`peak`), the line and the moves open along it (`line`, `open`), the
+    /// root move searched most (`most_searched`, once one is), the share of
+    /// the table's slots taken (from a sample), how full the proofs are, 1
+    /// being where they fill, and the nodes searched when they dropped their
+    /// mates in one, once they have. Together, the line and the moves are
+    /// this thread's.
+    fn report(&mut self, now: Instant) {
+        if self.progress.is_none() {
+            return;
+        }
+        let (proof, disproof) = self.root_now();
+        self.peak = self.peak.max(proof);
+        let (line, open) = self.line();
+        let most = self.most_searched();
         // Together, every thread's nodes, which `tick_together` has just
         // added up.
         let nodes = if self.together {
@@ -2436,25 +2606,38 @@ impl<'a> Dfpn<'a> {
         } else {
             self.nodes
         };
+        let table = (self.store.table.fill() * 1000.0).round() / 1000.0;
+        let proofs = (self.store.proofs.fill() * 1000.0).round() / 1000.0;
+        let dropped = self.mates_dropped;
+        let peak = self.peak;
+        let Some(progress) = &mut self.progress else {
+            return;
+        };
         let seconds = now.duration_since(progress.started).as_secs_f64();
         let recent = now.duration_since(progress.last.0).as_secs_f64();
         let rate = (nodes - progress.last.1) as f64 / recent.max(1e-9);
         progress.last = (now, nodes);
-        let mut line = serde_json::json!({
+        let mut record = serde_json::json!({
             "seconds": seconds.round() as u64,
             "nodes": nodes,
             "rate": rate.round() as u64,
-            "proof": self.root.0,
-            "disproof": self.root.1,
-            "table": (self.store.table.fill() * 1000.0).round() / 1000.0,
-            "proofs": (self.store.proofs.fill() * 1000.0).round() / 1000.0,
+            "proof": proof,
+            "disproof": disproof,
+            "peak": peak,
+            "line": line,
+            "open": open,
+            "table": table,
+            "proofs": proofs,
         });
-        if let Some(nodes) = self.mates_dropped {
-            line["mates_dropped"] = serde_json::json!(nodes);
+        if let Some(most) = most {
+            record["most_searched"] = serde_json::json!(most);
+        }
+        if let Some(nodes) = dropped {
+            record["mates_dropped"] = serde_json::json!(nodes);
         }
         match &mut progress.sink {
-            Some(sink) => sink(&line),
-            None => eprintln!("{line}"),
+            Some(sink) => sink(&record),
+            None => eprintln!("{record}"),
         }
     }
 }
@@ -2797,8 +2980,8 @@ mod tests {
     use shakmaty::{Position as _, variant::Atomic};
 
     use super::{
-        Child, Dfpn, Guide, INFINITY, Numbers, Proofs, Value, combine, crowd, perturb_model_step,
-        scale, share, split,
+        Child, Dfpn, Guide, INFINITY, Level, Numbers, Proofs, Value, combine, crowd,
+        perturb_model_step, scale, share, split,
     };
     use crate::board::from_fen;
 
@@ -3441,5 +3624,106 @@ mod tests {
         });
         assert_eq!((value.numbers.proof, value.numbers.disproof), (51, 2));
         assert_eq!((best, second), (2, 5));
+    }
+
+    /// The root's numbers rebuilt from the line combine each level's other
+    /// children with the numbers below, from the deepest level's child as it
+    /// was chosen up, as `combine` does: the attacker's least proof number
+    /// and summed disproof numbers, the defender's the other way round,
+    /// sums short of infinity; without a line, the root's own.
+    #[test]
+    fn rebuilds_the_roots_numbers_from_the_line() {
+        let root = Atomic::default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
+        search.root = (3, 4);
+        assert_eq!(search.root_now(), (3, 4));
+        let level = |attacking, proof, disproof, least, sum| Level {
+            m: Default::default(),
+            attacking,
+            taken: Numbers { proof, disproof },
+            least,
+            sum,
+            open: 2,
+        };
+        search.levels[0] = level(true, 50, 9, 7, 10);
+        search.levels[1] = level(false, 40, 9, 6, 8);
+        // Kept when the search went down, and replaced by the level below.
+        search.levels[2] = level(true, 2, 4, INFINITY, 0);
+        search.line_len = 3;
+        // Below: (2, 4); defending: (8 + 2, min(6, 4)) = (10, 4); attacking:
+        // (min(7, 10), 10 + 4) = (7, 14).
+        assert_eq!(search.root_now(), (7, 14));
+        search.levels[0] = level(true, 50, 9, 7, INFINITY - 2);
+        assert_eq!(search.root_now(), (7, INFINITY - 1));
+    }
+
+    /// A search's progress lines carry its line, the moves open along it, the
+    /// root move it has searched most and the root's numbers rebuilt from the
+    /// line with their peak; the search itself goes as it would without them,
+    /// and keeps no line unless it reports or is asked to.
+    #[test]
+    fn reports_its_line_and_numbers() {
+        let root = Atomic::default();
+        let run = |progress: bool, keep: bool| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
+            search.set_limit(20_000);
+            let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+            if progress {
+                let kept = records.clone();
+                search.set_progress_sink(
+                    Duration::ZERO,
+                    Box::new(move |record| kept.lock().unwrap().push(record.clone())),
+                );
+            }
+            if keep {
+                search.keep_line();
+            }
+            let found = search.solve(&root);
+            let records = records.lock().unwrap().clone();
+            (found, search.nodes, search.line(), records)
+        };
+        let (found, nodes, line, records) = run(true, false);
+        let (kept_found, kept_nodes, kept_line, _) = run(false, true);
+        assert_eq!((found, nodes, &line), (kept_found, kept_nodes, &kept_line));
+        let (quiet_found, quiet_nodes, quiet_line, _) = run(false, false);
+        assert_eq!((found, nodes), (quiet_found, quiet_nodes));
+        assert!(quiet_line.0.is_empty() && quiet_line.1.is_empty());
+        // A report at most every 1,024 nodes, where the clock is read.
+        assert!(records.len() >= 10, "{}", records.len());
+        let mut peak = 0;
+        for record in &records {
+            let moves = record["line"].as_array().unwrap();
+            let open = record["open"].as_array().unwrap();
+            assert!(!moves.is_empty() && moves.len() <= super::LINE, "{record}");
+            assert_eq!(moves.len(), open.len(), "{record}");
+            let mut pos = root.clone();
+            for (uci, open) in moves.iter().zip(open) {
+                let m = uci
+                    .as_str()
+                    .unwrap()
+                    .parse::<shakmaty::uci::UciMove>()
+                    .unwrap();
+                pos.play_unchecked(m.to_move(&pos).unwrap());
+                assert!(open.as_u64().unwrap() >= 1, "{record}");
+            }
+            let most = record["most_searched"].as_str().unwrap();
+            assert!(
+                root.legal_moves()
+                    .iter()
+                    .any(|&m| shakmaty::uci::UciMove::from_standard(m).to_string() == most),
+                "{record}"
+            );
+            let proof = record["proof"].as_u64().unwrap();
+            assert!(proof > 0 && proof < u64::from(INFINITY), "{record}");
+            peak = peak.max(proof);
+            assert_eq!(record["peak"].as_u64(), Some(peak), "{record}");
+        }
+        // Stopped, the search tells the line it was on.
+        assert!(
+            !line.0.is_empty() && line.0.len() == line.1.len(),
+            "{line:?}"
+        );
     }
 }

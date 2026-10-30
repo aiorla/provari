@@ -127,12 +127,16 @@ const rates = [];
 // The positions one thread proves, for the threads to prove again.
 const proven = [];
 for (const [i, fen] of positions.entries()) {
-  const ours = must(await request("prove", { request: { fen, nodes, memory_mb: memory } }));
+  // A search cut short gives the line it stopped on, which it keeps while it
+  // reports: here every 1,000 seconds, so never.
+  const ours = must(await request("prove", { request: { fen, nodes, memory_mb: memory, progress: 1000 } }));
   const proof = ours.proof;
   if (ours.found) proven.push(fen);
   const nativeProof = join(scratch, `native-${i}.pvr`);
-  const theirs = run("prove", fen, "--nodes", String(nodes), "--memory", String(memory), ...inputs, "--proofs", nativeProof);
-  const agree = ours.found === theirs.found && ours.nodes === theirs.nodes && (ours.mate ?? null) === (theirs.mate ?? null);
+  const theirs = run("prove", fen, "--json", "--progress", "1000", "--nodes", String(nodes), "--memory", String(memory),
+    ...inputs, "--proofs", nativeProof);
+  const agree = ours.found === theirs.found && ours.nodes === theirs.nodes && (ours.mate ?? null) === (theirs.mate ?? null) &&
+    same(ours.line ?? [], theirs.line ?? []);
   let checks = "";
   if (proof) {
     const webProof = join(scratch, `web-${i}.pvr`);
@@ -159,7 +163,8 @@ for (const [i, fen] of positions.entries()) {
 // Searches limited to wins in at most so many attacker moves.
 for (const [fen, most] of [[positions[1], 13], [positions[1], 9], [positions[2], 20]]) {
   const ours = must(await request("prove", { request: { fen, nodes, memory_mb: memory, most } }));
-  const theirs = run("prove", fen, "--nodes", String(nodes), "--memory", String(memory), "--most", String(most), ...inputs);
+  const theirs = run("prove", fen, "--json", "--nodes", String(nodes), "--memory", String(memory), "--most", String(most),
+    ...inputs);
   const agree = ours.found === theirs.found && ours.nodes === theirs.nodes &&
     (ours.mate ?? null) === (theirs.mate ?? null) && (ours.refuted ?? false) === (theirs.refuted ?? false);
   ok &&= agree && (!ours.found || ours.mate <= most);
@@ -172,7 +177,7 @@ const header = (bytes) => JSON.parse(decoder.decode(bytes.subarray(0, bytes.inde
 for (const fen of [positions[0], positions[1]]) {
   handed.length = 0;
   const ours = must(await request("prove", { request: { fen, nodes, memory_mb: memory, shorten: true } }));
-  const theirs = run("prove", fen, "--nodes", String(nodes), "--memory", String(memory), "--shorten", ...inputs);
+  const theirs = run("prove", fen, "--json", "--nodes", String(nodes), "--memory", String(memory), "--shorten", ...inputs);
   const lengths = handed.map((proof) => header(proof).moves);
   let valid = true;
   for (const proof of handed) valid &&= (await request("check", { proof })).valid === true;
@@ -194,7 +199,7 @@ for (const fen of [positions[0], positions[1]]) {
   const ours = must(await request("prove", { request: { fen, attacker: "white", nodes, memory_mb: memory } }));
   const proof = ours.proof;
   const nativeProof = join(scratch, "native-attacker.pvr");
-  const theirs = run("prove", fen, "--attacker", "white", "--nodes", String(nodes), "--memory", String(memory),
+  const theirs = run("prove", fen, "--json", "--attacker", "white", "--nodes", String(nodes), "--memory", String(memory),
     ...inputs, "--proofs", nativeProof);
   let agree = ours.found && theirs.found && ours.nodes === theirs.nodes && ours.mate === theirs.mate &&
     ours.attacker === "white" && theirs.attacker === "white";
@@ -216,7 +221,7 @@ for (const fen of [positions[0], positions[1]]) {
 // say how each ended.
 for (const fen of ["rnbq1bnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQ - 0 1", "k7/8/1Q6/8/8/8/8/6K1 b - - 0 1"]) {
   const ours = must(await request("prove", { request: { fen, nodes, memory_mb: memory } }));
-  const theirs = run("prove", fen, "--nodes", String(nodes), "--memory", String(memory), ...inputs);
+  const theirs = run("prove", fen, "--json", "--nodes", String(nodes), "--memory", String(memory), ...inputs);
   ok &&= !ours.found && ours.nodes === 0 && ours.over === theirs.over && ours.winner === theirs.winner;
   console.log(`over: ${ours.over}/${theirs.over}, winner ${ours.winner}/${theirs.winner}, nodes ${ours.nodes}`);
 }

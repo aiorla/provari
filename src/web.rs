@@ -199,10 +199,11 @@ pub extern "C" fn open_tables() -> u64 {
 /// the same budget, handing the page the proof of each win shorter as written
 /// (`provari.found`), the first win's included, so that a page can show it at
 /// once and keeps the best if it stops the search. The search stops at its
-/// deadline, its budget or the stop flag (`stop_flag`). Replies as `provari
-/// prove` prints, the proof kept for `take_proof`, or with `{"error"}` alone
-/// for a request it refuses, such as one for more memory than the browser
-/// gives.
+/// deadline, its budget or the stop flag (`stop_flag`). Hands the page its
+/// progress lines as `provari prove --json --progress` prints them, and
+/// replies as `provari prove --json` prints, the proof kept for
+/// `take_proof`, or with `{"error"}` alone for a request it refuses, such as
+/// one for more memory than the browser gives.
 ///
 /// # Safety
 ///
@@ -331,6 +332,14 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
         if disproof == 0 {
             result["refuted"] = json!(true);
         }
+    }
+    // Cut short, the line the search stopped on, the hardest it met, with
+    // the moves still open along it, where it kept it, while it reported
+    // (`Dfpn::line`).
+    let (line, open) = search.line();
+    if found.is_none() && result.get("refuted").is_none() && !line.is_empty() {
+        result["line"] = json!(line);
+        result["open"] = json!(open);
     }
     if let Some((first, first_ms, shortening)) = shortened {
         result["first_mate"] = json!(first);
