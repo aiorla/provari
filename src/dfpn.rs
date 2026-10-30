@@ -51,10 +51,24 @@
 //! table keeps what it learns apart for each number of moves left, since a
 //! position refuted for lack of moves may be won with more. A tablebase win
 //! says nothing of its length, so a limited search plays it out.
+//!
+//! Threads may search a position together (`try_with_threads`), as chess
+//! engines' threads do (Lazy SMP): they share the table and the proofs, each
+//! searches from the root with a seed of its own, which moves its path, and
+//! a thread that has searched 16 nodes since it last read its position's
+//! open children reads them again from the store before its next descent
+//! (`REFRESH_AFTER`), so that it builds on what the others have found. A
+//! thread also sees a child as dearer the more of the others search below
+//! it, as Kaneko's virtual numbers do (2010), so that the threads spread out
+//! over the tree rather than follow one line. The first to settle the root
+//! stops the others. Dropping the mates in one and rebuilding the table's
+//! filter move what every thread reads, so one thread makes them while the
+//! others wait (`pause`).
 
 use std::cmp::Reverse;
 use std::collections::TryReserveError;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::clock::Instant;
@@ -65,6 +79,7 @@ use crate::board::{Effect, Move, Position};
 use crate::model::{FEATURES, Model};
 use crate::moves::{self, Mover};
 use crate::nnue::{Accumulator, Network, RefreshCache, Transformed};
+use crate::pause::Pause;
 use crate::proofs::{Proof, Proofs};
 use crate::search::{Key, Status, status};
 use crate::table::{self, Known, Table};
@@ -115,6 +130,23 @@ const EF_B: u32 = 5;
 const MAGNITUDE: f32 = 0.25;
 const DECISIVE: i32 = 5 * 208;
 const HAND_DECISIVE: i32 = 500;
+
+/// What spreads a seed over all bits (`set_seed`).
+const SEED_SPREAD: u64 = 0xD1B5_4A32_D192_ED03;
+/// The bits of a position's hash that pick its slot among the threads' marks
+/// (`Store::busy`).
+const BUSY_BITS: u32 = 18;
+/// How much a child's deciding number grows, in percent of it and by at least
+/// 1, for each other thread searching below it (`crowd`): at 8 threads, 1
+/// proved 1.31 times as fast as 10.
+const SPREAD: u64 = 1;
+/// Together: the nodes a thread searches after reading what the others found
+/// of a position's children before it reads them again (`refresh`). A short
+/// search leaves the others little time to find anything, and a child the
+/// search goes on to is read anew there. Counted at 4 threads, 16 cut the
+/// reads by 85% with as many nodes to a proof; at 8 threads, it proved 1.08
+/// times as fast as a read after every child.
+const REFRESH_AFTER: u64 = 16;
 
 /// What guides the search's starting numbers.
 #[derive(Clone, Copy)]
@@ -266,6 +298,80 @@ pub struct Shortening {
     pub shortest: bool,
 }
 
+/// What a search keeps of what it learns, its table and its proofs, with
+/// what the threads that search a position together share about how the
+/// search goes (`try_with_threads`).
+struct Store {
+    table: Table,
+    /// The proven positions, in a fixed amount of memory. A proof that comes
+    /// out the same whenever it is worked out again (`recomputed`) is not
+    /// kept: the attacker exploding the king at once, the defender mated, or
+    /// a defence after which every move lets the king be exploded. The search
+    /// spots those whenever it scores the move leading there, and proofs
+    /// leave out the explosions for the checkers to find. Once the proofs
+    /// first fill, a mate in one is not kept either (`drop_mates`).
+    proofs: Proofs,
+    /// Whether the proofs keep mates in one: until they first fill, when they
+    /// drop them so that the search goes on (`drop_mates`).
+    mates_kept: AtomicBool,
+    /// How many threads search together: one for a search alone, which needs
+    /// none of the rest.
+    threads: usize,
+    /// The nodes the threads have searched, as each adds its own now and then.
+    nodes: AtomicU64,
+    /// Stops every thread at its next look at the clock: set when one settles
+    /// the root, or the budget, the deadline, the stop flag or the proofs end
+    /// the search.
+    stop: AtomicBool,
+    /// Whether the proofs filled their memory, which stops the search.
+    full: AtomicBool,
+    /// The nodes searched when the proofs dropped their mates in one.
+    mates_dropped: Mutex<Option<u64>>,
+    /// The root's numbers as the thread that settled it left them.
+    settled: Mutex<Option<Numbers>>,
+    /// Lets a thread drop the mates in one, or rebuild or drop the table's
+    /// filter, while the others wait, as these move what they read.
+    pause: Pause,
+    /// Together: how many threads search below each position, by its hash
+    /// (`crowded`); none for a search alone.
+    busy: Vec<AtomicU16>,
+}
+
+/// A thread's part in a search together, from before it starts: when it
+/// ends, the pause no longer waits for it, and if it panicked, the others
+/// stop too, and the search fails with it once they end.
+struct Part<'s>(&'s Store);
+
+impl<'s> Part<'s> {
+    fn new(store: &'s Store) -> Part<'s> {
+        store.pause.enter();
+        Part(store)
+    }
+}
+
+impl Drop for Part<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.stop.store(true, Relaxed);
+        }
+        self.0.pause.leave();
+    }
+}
+
+/// What a thread that helps a search takes from it: all but its own state.
+#[derive(Clone, Copy)]
+struct Settings<'a> {
+    attacker: Color,
+    tablebase: Option<&'a Tablebase>,
+    guide: Guide<'a>,
+    deadline: Instant,
+    stop: Option<&'a AtomicBool>,
+    limit: u64,
+    drop_mates_at: usize,
+    most: Option<u32>,
+    root_attacking: bool,
+}
+
 pub struct Dfpn<'a> {
     attacker: Color,
     tablebase: Option<&'a Tablebase>,
@@ -281,15 +387,18 @@ pub struct Dfpn<'a> {
     /// The expanded position's first layer as the dense layers and the model
     /// read it.
     transformed: Box<Transformed>,
-    table: Table,
-    /// The proven positions, in a fixed amount of memory. A proof that comes
-    /// out the same whenever it is worked out again (`recomputed`) is not
-    /// kept: the attacker exploding the king at once, the defender mated, or
-    /// a defence after which every move lets the king be exploded. The search
-    /// spots those whenever it scores the move leading there, and proofs
-    /// leave out the explosions for the checkers to find. Once the proofs
-    /// first fill, a mate in one is not kept either (`drop_mates`).
-    proofs: Proofs,
+    /// The table and the proofs, which other threads may share.
+    store: Arc<Store>,
+    /// Whether other threads search with this one, sharing its store.
+    together: bool,
+    /// Together: the nodes this thread has added to the store's, and the
+    /// entries it has stored in the table since it last added them (`flush`).
+    flushed: u64,
+    puts: usize,
+    /// Whether the table's filter is read, as this thread last took it from
+    /// the table (`Table::filtering`): after each change it made, and after
+    /// waiting while another thread made one.
+    filtering: bool,
     path: Vec<u64>,
     /// How often each attacker move, by piece and destination, proved a
     /// position, and how often each defence refuted one.
@@ -315,9 +424,6 @@ pub struct Dfpn<'a> {
     limit: u64,
     /// The proofs filled their memory, which stopped the search.
     full: bool,
-    /// Whether the proofs keep mates in one: until they first fill, when they
-    /// drop them so that the search goes on (`drop_mates`).
-    mates_kept: bool,
     /// The proofs taken at which they drop their mates in one, if before they
     /// fill: for tests of the search after.
     drop_mates_at: usize,
@@ -364,19 +470,68 @@ impl<'a> Dfpn<'a> {
         tablebase: Option<&'a Tablebase>,
         guide: Guide<'a>,
         deadline: Instant,
-        (table_mb, proofs_mb): (usize, usize),
+        memory: (usize, usize),
     ) -> Result<Dfpn<'a>, TryReserveError> {
-        Ok(Dfpn {
+        Dfpn::try_with_threads(root, tablebase, guide, deadline, memory, 1)
+    }
+
+    /// As `try_new`, for `threads` threads that search together, sharing the
+    /// table and the proofs: this search is one of them, and starts the
+    /// others for each `solve`, each with a seed of its own.
+    pub fn try_with_threads(
+        root: &Atomic,
+        tablebase: Option<&'a Tablebase>,
+        guide: Guide<'a>,
+        deadline: Instant,
+        (table_mb, proofs_mb): (usize, usize),
+        threads: usize,
+    ) -> Result<Dfpn<'a>, TryReserveError> {
+        let threads = threads.max(1);
+        let shared = threads > 1;
+        let store = Store {
+            table: Table::new(table_mb, shared)?,
+            proofs: Proofs::new(proofs_mb, shared)?,
+            mates_kept: AtomicBool::new(true),
+            threads,
+            nodes: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            full: AtomicBool::new(false),
+            mates_dropped: Mutex::new(None),
+            settled: Mutex::new(None),
+            pause: Pause::new(),
+            busy: if shared { busy_slots()? } else { Vec::new() },
+        };
+        let settings = Settings {
             attacker: shakmaty::Position::turn(root),
             tablebase,
             guide,
+            deadline,
+            stop: None,
+            limit: u64::MAX,
+            drop_mates_at: usize::MAX,
+            most: None,
+            root_attacking: true,
+        };
+        Ok(Dfpn::with_store(Arc::new(store), settings))
+    }
+
+    /// A search with these settings and a state of its own, which keeps what
+    /// it learns in `store`.
+    fn with_store(store: Arc<Store>, settings: Settings<'a>) -> Dfpn<'a> {
+        Dfpn {
+            attacker: settings.attacker,
+            tablebase: settings.tablebase,
+            guide: settings.guide,
             frames: Vec::new(),
             refresh_cache: None,
             scratch_frame: Box::default(),
             scratch_transformed: Box::default(),
             transformed: Box::default(),
-            table: Table::new(table_mb)?,
-            proofs: Proofs::new(proofs_mb)?,
+            together: store.threads > 1,
+            filtering: store.table.filtering(),
+            store,
+            flushed: 0,
+            puts: 0,
             path: Vec::new(),
             attack_history: vec![0; 7 * 64],
             defense_history: vec![0; 7 * 64],
@@ -385,17 +540,16 @@ impl<'a> Dfpn<'a> {
             scratch: Vec::new(),
             line: Vec::new(),
             repetitions: [0; 16],
-            deadline,
-            stop: None,
-            limit: u64::MAX,
+            deadline: settings.deadline,
+            stop: settings.stop,
+            limit: settings.limit,
             full: false,
-            mates_kept: true,
-            drop_mates_at: usize::MAX,
+            drop_mates_at: settings.drop_mates_at,
             progress: None,
             root: (1, 1),
             seed: 0,
-            most: None,
-            root_attacking: true,
+            most: settings.most,
+            root_attacking: settings.root_attacking,
             nodes: 0,
             stopped: false,
             mates_dropped: None,
@@ -403,7 +557,22 @@ impl<'a> Dfpn<'a> {
             sampler: None,
             record: false,
             recorded: None,
-        })
+        }
+    }
+
+    /// What a thread that helps this search takes from it.
+    fn settings(&self) -> Settings<'a> {
+        Settings {
+            attacker: self.attacker,
+            tablebase: self.tablebase,
+            guide: self.guide,
+            deadline: self.deadline,
+            stop: self.stop,
+            limit: self.limit,
+            drop_mates_at: self.drop_mates_at,
+            most: self.most,
+            root_attacking: self.root_attacking,
+        }
     }
 
     /// Searches for a win of `attacker`, who need not be the side to move.
@@ -415,7 +584,7 @@ impl<'a> Dfpn<'a> {
     /// way, by the position and the seed (a model's through its odds). 0
     /// leaves it alone.
     pub fn set_seed(&mut self, seed: u64) {
-        self.seed = seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        self.seed = seed.wrapping_mul(SEED_SPREAD);
     }
 
     /// Stops the search after `nodes` nodes as well as at the deadline: unlike
@@ -480,7 +649,11 @@ impl<'a> Dfpn<'a> {
         }
         self.root_attacking = shakmaty::Position::turn(root) == self.attacker;
         let root = Position::from_atomic(root);
-        let numbers = self.mid(&root, INFINITY, INFINITY).numbers;
+        let numbers = if self.together {
+            self.search_together(&root)
+        } else {
+            self.mid(&root, INFINITY, INFINITY).numbers
+        };
         self.root_numbers = Some((numbers.proof, numbers.disproof));
         // Once the proofs are full, a win may rest on a proof never kept.
         if numbers.proof != 0 || self.full {
@@ -489,6 +662,70 @@ impl<'a> Dfpn<'a> {
         self.proof_at(root.hash(), root.halfmoves())
             .or_else(|| self.recomputed(&root))
             .map(|proof| proof.length)
+    }
+
+    /// Searches the root with the other threads until one of them settles it
+    /// or they stop: this thread with its own seed, each other with another.
+    /// Returns the root's numbers as the thread that settled it left them,
+    /// else as this one did.
+    fn search_together(&mut self, root: &Position) -> Numbers {
+        let store = Arc::clone(&self.store);
+        store.nodes.store(self.nodes, Relaxed);
+        store.stop.store(false, Relaxed);
+        *lock(&store.settled) = None;
+        self.flushed = self.nodes;
+        self.puts = 0;
+        let settings = self.settings();
+        let numbers = std::thread::scope(|scope| {
+            for thread in 1..store.threads {
+                let part = Part::new(&store);
+                let (shared, seed) = (Arc::clone(&store), self.seed);
+                let helper = std::thread::Builder::new().stack_size(crate::STACK);
+                // A thread that cannot start drops its part: the others search
+                // without it.
+                let _ = helper.spawn_scoped(scope, move || {
+                    let _part = part;
+                    let mut search = Dfpn::with_store(shared, settings);
+                    search.seed = seed.wrapping_add(SEED_SPREAD.wrapping_mul(thread as u64));
+                    search.search_root(root)
+                });
+            }
+            let _part = Part::new(&store);
+            self.search_root(root)
+        });
+        // The others may have changed the filter after this thread left.
+        self.filtering = store.table.filtering();
+        self.nodes = store.nodes.load(Relaxed);
+        self.full = store.full.load(Relaxed);
+        if self.mates_dropped.is_none() {
+            self.mates_dropped = *lock(&store.mates_dropped);
+        }
+        let settled = lock(&store.settled).take();
+        self.stopped = settled.is_none();
+        settled.unwrap_or(numbers)
+    }
+
+    /// One thread's search of the root among others: once it settles the
+    /// root, they stop.
+    fn search_root(&mut self, root: &Position) -> Numbers {
+        let numbers = self.mid(root, INFINITY, INFINITY).numbers;
+        self.flush();
+        if numbers.proof == 0 || numbers.disproof == 0 {
+            lock(&self.store.settled).get_or_insert(numbers);
+            self.store.stop.store(true, Relaxed);
+        }
+        numbers
+    }
+
+    /// Together: adds this thread's nodes since it last did to the store's,
+    /// and its entries to the table's count of them, and returns every
+    /// thread's nodes.
+    fn flush(&mut self) -> u64 {
+        let new = self.nodes - self.flushed;
+        self.flushed = self.nodes;
+        let puts = std::mem::take(&mut self.puts);
+        self.table().count(puts);
+        self.store.nodes.fetch_add(new, Relaxed) + new
     }
 
     /// After a win of `length`, searches again with a limit one below the
@@ -548,7 +785,7 @@ impl<'a> Dfpn<'a> {
     /// Has the proofs drop their mates in one once they hold this share of
     /// their room, rather than when they fill: for tests of the search after.
     pub fn set_drop_mates_at(&mut self, share: f64) {
-        self.drop_mates_at = (self.proofs.room() as f64 * share) as usize;
+        self.drop_mates_at = (self.proofs().room() as f64 * share) as usize;
         if self.drop_mates_at == 0 {
             self.drop_mates();
         }
@@ -614,8 +851,16 @@ impl<'a> Dfpn<'a> {
         let depth = self.path.len() as u32;
         self.path.push(hash);
         let mut opened = None;
+        // Together: this thread's nodes when it last read the children.
+        let mut read = self.nodes;
         let (value, best) = loop {
-            let (value, best, second) = combine(&children, attacking);
+            let (value, best, second) = if !self.together {
+                combine(&children, attacking, |_, deciding| deciding)
+            } else {
+                combine(&children, attacking, |child, deciding| {
+                    self.crowded(child, deciding)
+                })
+            };
             let numbers = value.numbers;
             if depth == 0 {
                 self.root = (numbers.proof, numbers.disproof);
@@ -650,7 +895,16 @@ impl<'a> Dfpn<'a> {
             };
             let next = pos.play(children[best].m);
             debug_assert_eq!(next.hash(), children[best].hash);
+            // Together, the other threads see this one below the child while
+            // it searches there.
+            let busy = self.together.then(|| busy_slot(children[best].hash));
+            if let Some(slot) = busy {
+                self.store.busy[slot].fetch_add(1, Relaxed);
+            }
             let value = self.mid(&next, child_proof, child_disproof);
+            if let Some(slot) = busy {
+                self.store.busy[slot].fetch_sub(1, Relaxed);
+            }
             children[best].value = value;
             // A defence just proven may prove its siblings too: replay its
             // proof on each defence still open.
@@ -676,6 +930,10 @@ impl<'a> Dfpn<'a> {
                         sibling.value = Value::WON;
                     }
                 }
+            }
+            if self.together && !self.stopped && self.nodes - read >= REFRESH_AFTER {
+                read = self.nodes;
+                self.refresh(pos, &mut children);
             }
         };
         self.path.pop();
@@ -734,6 +992,62 @@ impl<'a> Dfpn<'a> {
         value
     }
 
+    /// Together: what the store now knows of the open children, which other
+    /// threads may have searched since this one looked, as `mid` would find
+    /// it on reaching each, with this position on the line.
+    fn refresh(&self, pos: &Position, children: &mut [Child]) {
+        let remaining = self.remaining(self.path.len());
+        let filtering = self.filtering;
+        let open =
+            |child: &Child| child.value.numbers.proof != 0 && child.value.numbers.disproof != 0;
+        let moves = |child: &&Child| open(child) && !child.group;
+        // The reads started first, as `children` starts them: the filter's
+        // words, then the entries of the children it may hold.
+        for child in children.iter().filter(moves) {
+            self.prefetch_child(child.hash, remaining, filtering);
+        }
+        if filtering {
+            for child in children.iter().filter(moves) {
+                let key = self.key(child.hash, remaining);
+                if self.seen(child.hash, key) {
+                    self.table().prefetch(key);
+                    self.proofs().prefetch(child.hash);
+                }
+            }
+        }
+        for child in children.iter_mut().filter(|child| open(child)) {
+            let known = if child.group {
+                self.lookup(child.hash, child.counter, |_| false)
+                    .filter(|value| value.numbers.disproof != 0)
+            } else if self
+                .proof_within(child.hash, child.counter, remaining)
+                .is_some()
+            {
+                Some(Value::WON)
+            } else {
+                let key = self.key(child.hash, remaining);
+                self.lookup(key, child.counter, |mate| {
+                    self.mates_with(&pos.play(child.m), mate)
+                })
+            };
+            if let Some(value) = known {
+                child.value = value;
+                child.fresh = false;
+            }
+        }
+    }
+
+    /// Together: a child's deciding number as this thread sees it, grown for
+    /// each other thread searching below it (`crowd`). The plain moves'
+    /// group is never searched below, so none is.
+    fn crowded(&self, child: &Child, deciding: u32) -> u32 {
+        if child.group {
+            return deciding;
+        }
+        let busy = self.store.busy[busy_slot(child.hash)].load(Relaxed);
+        crowd(deciding, busy)
+    }
+
     /// Scores a position's moves into `children`, with `remaining` attacker
     /// moves left, and returns the step its evaluation scaled their starting
     /// numbers by.
@@ -763,7 +1077,7 @@ impl<'a> Dfpn<'a> {
         // not wait on one another, so their latencies overlap.
         let mut legal = std::mem::take(&mut self.scratch);
         legal.clear();
-        let filtering = self.table.filtering();
+        let filtering = self.filtering;
         for &m in candidates.as_slice() {
             if group && mover.plain(m) {
                 plain += u32::from(mover.legal(m));
@@ -822,7 +1136,7 @@ impl<'a> Dfpn<'a> {
     fn last_children(&mut self, pos: &Position, mover: &Mover, children: &mut Vec<Child>) {
         let mut legal = std::mem::take(&mut self.scratch);
         legal.clear();
-        let filtering = self.table.filtering();
+        let filtering = self.filtering;
         for &m in pos.pseudo_legal().as_slice() {
             if mover.plain(m) || !mover.legal(m) {
                 continue;
@@ -1035,7 +1349,7 @@ impl<'a> Dfpn<'a> {
         // The moves first, their filter words' loads started, as in `children`.
         let mut plain = std::mem::take(&mut self.scratch);
         plain.clear();
-        let filtering = self.table.filtering();
+        let filtering = self.filtering;
         for &m in pos.pseudo_legal().as_slice() {
             if mover.plain(m) && mover.legal(m) {
                 let effect = mover.full_effect(m);
@@ -1540,7 +1854,7 @@ impl<'a> Dfpn<'a> {
 
     /// A mate in one, once the proofs have dropped them and keep none.
     fn dropped_mate(&self, pos: &Position) -> Option<Move> {
-        if self.mates_kept {
+        if self.mates_kept() {
             None
         } else {
             self.mate_in_one(pos)
@@ -1584,13 +1898,13 @@ impl<'a> Dfpn<'a> {
     /// move rather than a node.
     fn keep_attacker(&mut self, pos: &Position, proof: Proof, mated: bool) {
         let hash = pos.hash();
-        if self.mates_kept {
+        if self.mates_kept() {
             if !mated {
                 self.add_proof(hash, proof);
                 return;
             }
-            self.table.note(hash);
-            if self.proofs.add_mate(hash, proof) && self.proofs.taken() < self.drop_mates_at {
+            self.filtering = self.table().note(hash, self.filtering);
+            if self.proofs().add_mate(hash, proof) && self.proofs().taken() < self.drop_mates_at {
                 return;
             }
             // Dropped with the others.
@@ -1603,10 +1917,12 @@ impl<'a> Dfpn<'a> {
         };
         match mate {
             Some(m) => {
-                self.proofs.remove(hash);
+                self.proofs().remove(hash);
                 // With a limit, the table's keys count the moves left.
                 if self.most.is_none() {
-                    self.table.put(hash, Known::Mate(m.bits()), 1);
+                    let known = Known::Mate(m.bits());
+                    self.filtering = self.table().put(hash, known, 1, self.filtering);
+                    self.puts += usize::from(self.together);
                     self.refresh_filter();
                 }
             }
@@ -1636,7 +1952,7 @@ impl<'a> Dfpn<'a> {
             // The moves first, their table reads started, as `children` does.
             let mut moves = std::mem::take(&mut self.scratch);
             moves.clear();
-            let filtering = self.table.filtering();
+            let filtering = self.filtering;
             for &m in passed.pseudo_legal().as_slice() {
                 if mover.plain(m) || !mover.legal(m) {
                     continue;
@@ -1753,7 +2069,8 @@ impl<'a> Dfpn<'a> {
     /// Whether the proofs or the table may hold a child: its hash for the
     /// proofs, its key for the table.
     fn seen(&self, hash: u64, key: u64) -> bool {
-        self.table.may_hold(hash) || (key != hash && self.table.may_hold(key))
+        self.table().may_hold(hash, self.filtering)
+            || (key != hash && self.table().may_hold(key, self.filtering))
     }
 
     /// Starts loading what a child's scoring reads: its filter words while the
@@ -1762,8 +2079,8 @@ impl<'a> Dfpn<'a> {
         if filtering {
             self.prefetch_seen(hash, remaining);
         } else {
-            self.table.prefetch(self.key(hash, remaining));
-            self.proofs.prefetch(hash);
+            self.table().prefetch(self.key(hash, remaining));
+            self.proofs().prefetch(hash);
         }
     }
 
@@ -1774,8 +2091,8 @@ impl<'a> Dfpn<'a> {
             let key = self.key(effect.hash, remaining);
             *seen = self.seen(effect.hash, key);
             if *seen {
-                self.table.prefetch(key);
-                self.proofs.prefetch(effect.hash);
+                self.table().prefetch(key);
+                self.proofs().prefetch(effect.hash);
             }
         }
     }
@@ -1783,10 +2100,10 @@ impl<'a> Dfpn<'a> {
     /// Starts loading the filter's words for a child: for its hash, and for
     /// its key under a limit on moves.
     fn prefetch_seen(&self, hash: u64, remaining: u32) {
-        self.table.prefetch_filter(hash);
+        self.table().prefetch_filter(hash);
         let key = self.key(hash, remaining);
         if key != hash {
-            self.table.prefetch_filter(key);
+            self.table().prefetch_filter(key);
         }
     }
 
@@ -1800,7 +2117,7 @@ impl<'a> Dfpn<'a> {
     /// What the table knows about a position at this counter on this line: a
     /// mate in one only where `mates` finds that its move mates.
     fn lookup(&self, hash: u64, counter: u32, mates: impl FnOnce(Move) -> bool) -> Option<Value> {
-        match self.table.get(hash)? {
+        match self.table().get(hash, self.filtering)? {
             Known::Mate(bits) => mates(Move::from_bits(bits)).then_some(Value::WON),
             Known::Open { proof, disproof } => Some(Value::open(Numbers { proof, disproof })),
             Known::Refuted { cycle, from } => {
@@ -1841,25 +2158,62 @@ impl<'a> Dfpn<'a> {
                 from: if value.fifty { counter } else { 0 },
             }
         };
-        self.table.put(hash, known, work);
+        self.filtering = self.table().put(hash, known, work, self.filtering);
+        self.puts += usize::from(self.together);
         self.refresh_filter();
     }
 
-    /// Rebuilds the table's filter once it is stale.
+    /// Rebuilds the table's filter once it is stale; together, the threads
+    /// count their entries now and then, and `tick_together` rebuilds it or
+    /// drops it.
     #[inline(always)]
     fn refresh_filter(&mut self) {
-        if self.table.filter_is_stale() {
-            self.table
-                .rebuild_filter(self.proofs.keys(), self.proofs.taken());
+        if !self.together && self.table().filter_is_stale() {
+            self.filtering = self
+                .table()
+                .rebuild_filter(self.proofs().keys(), self.proofs().taken());
         }
+    }
+
+    /// Together: rebuilds the table's filter once it is stale, or drops it
+    /// once it is dense, while the other threads wait, unless one did
+    /// meanwhile; returns whether the filter is read.
+    #[cold]
+    fn change_filter_alone(&self) -> bool {
+        let store = &*self.store;
+        store.pause.alone(|| {
+            if store.table.filter_is_stale() {
+                store
+                    .table
+                    .rebuild_filter(store.proofs.keys(), store.proofs.taken());
+            } else if store.table.filter_is_dense() {
+                store.table.drop_filter();
+            }
+        });
+        store.table.filtering()
+    }
+
+    /// The table, which other threads may share.
+    fn table(&self) -> &Table {
+        &self.store.table
+    }
+
+    /// The proofs, which other threads may share.
+    fn proofs(&self) -> &Proofs {
+        &self.store.proofs
+    }
+
+    /// Whether the proofs keep mates in one (`drop_mates`).
+    fn mates_kept(&self) -> bool {
+        self.store.mates_kept.load(Relaxed)
     }
 
     /// The shortest proof of a position that holds at this counter.
     fn proof_at(&self, hash: u64, counter: u32) -> Option<Proof> {
-        if !self.table.may_hold(hash) {
+        if !self.table().may_hold(hash, self.filtering) {
             return None;
         }
-        self.proofs.get(hash, counter)
+        self.proofs().get(hash, counter)
     }
 
     /// The attacker's capture that explodes the defender's king at once before
@@ -1956,34 +2310,64 @@ impl<'a> Dfpn<'a> {
     /// Keeps a proof. When the proofs fill, the first time they drop their
     /// mates in one (`drop_mates`), and the second the search stops.
     fn add_proof(&mut self, hash: u64, proof: Proof) {
-        self.table.note(hash);
-        if self.proofs.add(hash, proof) {
-            if self.mates_kept && self.proofs.taken() >= self.drop_mates_at {
+        self.filtering = self.table().note(hash, self.filtering);
+        if self.proofs().add(hash, proof) {
+            if self.mates_kept() && self.proofs().taken() >= self.drop_mates_at {
                 self.drop_mates();
             }
             return;
         }
-        if self.mates_kept {
+        if self.mates_kept() {
             self.drop_mates();
-            if self.proofs.add(hash, proof) {
+            if self.proofs().add(hash, proof) {
                 return;
             }
         }
         self.full = true;
         self.stopped = true;
+        if self.together {
+            self.store.full.store(true, Relaxed);
+            self.store.stop.store(true, Relaxed);
+        }
     }
 
     /// Drops the mates in one from the proofs, so that the search goes on once
     /// they fill: from then on it keeps none (`keep_attacker`), and works each
     /// out again where it needs one (`recomputed`).
     fn drop_mates(&mut self) {
-        self.mates_kept = false;
-        self.proofs.drop_mates();
+        if self.together {
+            return self.drop_mates_alone();
+        }
+        self.store.mates_kept.store(false, Relaxed);
+        self.proofs().drop_mates();
         self.mates_dropped = Some(self.nodes);
+    }
+
+    /// Together: `drop_mates` while the other threads wait, unless one did
+    /// meanwhile, as they do when the proofs fill for them too.
+    #[cold]
+    fn drop_mates_alone(&mut self) {
+        let nodes = self.flush();
+        let store = &*self.store;
+        store.pause.alone(|| {
+            if store.mates_kept.load(Relaxed) {
+                store.mates_kept.store(false, Relaxed);
+                store.proofs.drop_mates();
+                *lock(&store.mates_dropped) = Some(nodes);
+            }
+        });
+        // Another thread's change may have come first.
+        self.filtering = store.table.filtering();
+        if self.mates_dropped.is_none() {
+            self.mates_dropped = *lock(&store.mates_dropped);
+        }
     }
 
     fn tick(&mut self) {
         self.nodes += 1;
+        if self.together {
+            return self.tick_together();
+        }
         if self.nodes >= self.limit {
             self.stopped = true;
         } else if self.nodes.is_multiple_of(1024) {
@@ -2000,6 +2384,42 @@ impl<'a> Dfpn<'a> {
         }
     }
 
+    /// `tick` for a thread among others: it waits while another changes the
+    /// store alone, and every 1,024 nodes adds its nodes to the store's, stops
+    /// every thread at the budget, the deadline or the stop flag, stops itself
+    /// once another has, and rebuilds a stale filter or drops a dense one.
+    fn tick_together(&mut self) {
+        if self.store.pause.check() {
+            self.filtering = self.table().filtering();
+        }
+        // By the nodes since the last flush, not a multiple of 1,024, which
+        // the nodes that simulations count between ticks can step over.
+        if self.nodes - self.flushed < 1024 {
+            return;
+        }
+        let nodes = self.flush();
+        let now = Instant::now();
+        let store = &*self.store;
+        if nodes >= self.limit
+            || now >= self.deadline
+            || self.stop.is_some_and(|stop| stop.load(Relaxed))
+        {
+            store.stop.store(true, Relaxed);
+        }
+        if store.stop.load(Relaxed) {
+            self.stopped = true;
+        }
+        if store.table.filter_is_stale() || store.table.filter_is_dense() {
+            self.filtering = self.change_filter_alone();
+        }
+        if let Some(progress) = &mut self.progress
+            && now >= progress.next
+        {
+            progress.next = now + progress.every;
+            self.report(now);
+        }
+    }
+
     /// Prints a line on how the search goes, to standard error: the seconds
     /// and nodes so far, the nodes a second since the last line, the root's
     /// proof and disproof numbers, the share of the table's slots taken (from
@@ -2009,18 +2429,25 @@ impl<'a> Dfpn<'a> {
         let Some(progress) = &mut self.progress else {
             return;
         };
+        // Together, every thread's nodes, which `tick_together` has just
+        // added up.
+        let nodes = if self.together {
+            self.store.nodes.load(Relaxed)
+        } else {
+            self.nodes
+        };
         let seconds = now.duration_since(progress.started).as_secs_f64();
         let recent = now.duration_since(progress.last.0).as_secs_f64();
-        let rate = (self.nodes - progress.last.1) as f64 / recent.max(1e-9);
-        progress.last = (now, self.nodes);
+        let rate = (nodes - progress.last.1) as f64 / recent.max(1e-9);
+        progress.last = (now, nodes);
         let mut line = serde_json::json!({
             "seconds": seconds.round() as u64,
-            "nodes": self.nodes,
+            "nodes": nodes,
             "rate": rate.round() as u64,
             "proof": self.root.0,
             "disproof": self.root.1,
-            "table": (self.table.fill() * 1000.0).round() / 1000.0,
-            "proofs": (self.proofs.fill() * 1000.0).round() / 1000.0,
+            "table": (self.store.table.fill() * 1000.0).round() / 1000.0,
+            "proofs": (self.store.proofs.fill() * 1000.0).round() / 1000.0,
         });
         if let Some(nodes) = self.mates_dropped {
             line["mates_dropped"] = serde_json::json!(nodes);
@@ -2030,6 +2457,11 @@ impl<'a> Dfpn<'a> {
             None => eprintln!("{line}"),
         }
     }
+}
+
+/// A lock's value, also after a thread panicked holding it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Whether a child's proof, by its length and limit, is a finished game: for
@@ -2170,8 +2602,14 @@ fn scale(children: &mut [Child], attacking: bool, step: Option<f32>) {
 }
 
 /// Combines the children: the position's value, the child to search, and the
-/// second-best child's deciding number.
-fn combine(children: &[Child], attacking: bool) -> (Value, usize, u32) {
+/// second-best child's deciding number, each child's deciding number as
+/// `seen` sees it from its own (`crowded`); the other numbers are summed as
+/// they are.
+fn combine(
+    children: &[Child],
+    attacking: bool,
+    mut seen: impl FnMut(&Child, u32) -> u32,
+) -> (Value, usize, u32) {
     let mut best_score = 0;
     let mut best = 0;
     let mut first = u32::MAX;
@@ -2192,6 +2630,13 @@ fn combine(children: &[Child], attacking: bool) -> (Value, usize, u32) {
             (numbers.disproof, numbers.proof)
         };
         sum = sum.saturating_add(summed);
+        // A child seen no cheaper than it is, already dearer than the second
+        // best, can be neither: it needs no look.
+        let deciding = if deciding > second {
+            deciding
+        } else {
+            seen(child, deciding)
+        };
         // Ties go to the move with more history.
         if deciding < first || (deciding == first && child.score > best_score) {
             second = first;
@@ -2254,6 +2699,32 @@ fn combine(children: &[Child], attacking: bool) -> (Value, usize, u32) {
         }
     };
     (value, best, second)
+}
+
+/// A deciding number grown by `SPREAD` percent of it, and at least 1, for
+/// each of `busy` threads searching below its position, as Kaneko's virtual
+/// numbers count them (2010), and kept below infinity, which would read as
+/// settled. A settled position's stays as it is.
+fn crowd(deciding: u32, busy: u16) -> u32 {
+    if busy == 0 || deciding == 0 || deciding >= INFINITY {
+        return deciding;
+    }
+    let each = (u64::from(deciding) * SPREAD).div_ceil(100).max(1);
+    let crowded = u64::from(deciding) + each * u64::from(busy);
+    crowded.min(u64::from(INFINITY - 1)) as u32
+}
+
+/// A position's slot among the threads' marks (`Store::busy`).
+fn busy_slot(hash: u64) -> usize {
+    (hash >> (64 - BUSY_BITS)) as usize
+}
+
+/// The threads' marks, all clear, unless the memory cannot be had.
+fn busy_slots() -> Result<Vec<AtomicU16>, TryReserveError> {
+    let mut busy = Vec::new();
+    busy.try_reserve_exact(1 << BUSY_BITS)?;
+    busy.resize_with(1 << BUSY_BITS, AtomicU16::default);
+    Ok(busy)
 }
 
 /// A model's step, between 0 and 2, with its odds, step / (2 - step), moved
@@ -2319,13 +2790,15 @@ fn mates(mover: &Mover, pos: &Position, m: Move) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
     use std::time::{Duration, Instant};
 
     use shakmaty::{Position as _, variant::Atomic};
 
     use super::{
-        Child, Dfpn, Guide, INFINITY, Numbers, Proofs, Value, perturb_model_step, scale, share,
-        split,
+        Child, Dfpn, Guide, INFINITY, Numbers, Proofs, Value, combine, crowd, perturb_model_step,
+        scale, share, split,
     };
     use crate::board::from_fen;
 
@@ -2687,7 +3160,7 @@ mod tests {
         let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
         assert!(search.solve(&root).is_some() && !search.proofs_full());
         let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
-        search.proofs = Proofs::new(0).unwrap();
+        Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::new(0, false).unwrap();
         assert_eq!(search.solve(&root), None);
         assert!(search.proofs_full() && search.stopped && search.mates_dropped.is_some());
     }
@@ -2717,7 +3190,7 @@ mod tests {
         let solve = |slots, share: Option<f64>| {
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
-            search.proofs = Proofs::sized(slots);
+            Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::sized(slots, false);
             if let Some(share) = share {
                 search.set_drop_mates_at(share);
             }
@@ -2783,5 +3256,190 @@ mod tests {
             "{plain:?} {seeded:?}"
         );
         assert_ne!(plain.1, seeded.1, "the seed left the search unchanged");
+    }
+
+    /// A search with `threads` threads together, with a table and proofs of
+    /// so many megabytes.
+    fn together<'a>(root: &Atomic, threads: usize, memory: (usize, usize)) -> Dfpn<'a> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        Dfpn::try_with_threads(root, None, Guide::Hand, deadline, memory, threads).unwrap()
+    }
+
+    /// Threads that search together prove the wins one thread proves, each
+    /// with a proof the checker confirms, also under a limit on moves, and
+    /// settle a root with no win so short as refuted; they leave no mark of
+    /// a thread below any position.
+    #[test]
+    fn threads_prove_what_one_proves() {
+        for fen in [
+            "r1b1kbnr/pp1pq2p/2n1ppp1/1B6/3PPB2/5N2/PPP2PPP/R2QK2R w KQkq - 0 1",
+            "r1bqkbnr/1p1p2pp/p1n2p2/1B2p3/3PP3/2P2N2/PP3PPP/R1BQK2R w KQkq - 0 1",
+            "r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1",
+        ] {
+            let root = from_fen(fen).unwrap().to_atomic();
+            for threads in [2, 4] {
+                let mut search = together(&root, threads, split(4, 0));
+                assert!(search.solve(&root).is_some(), "{fen} with {threads}");
+                assert!(!search.stopped && !search.proofs_full());
+                checked_length(&search, &root);
+                let busy = &search.store.busy;
+                assert!(busy.iter().all(|slot| slot.load(Relaxed) == 0));
+            }
+        }
+        let root = from_fen("r1bqkbnr/1p1p2pp/p1n2p2/1B2p3/3PP3/2P2N2/PP3PPP/R1BQK2R w KQkq - 0 1")
+            .unwrap()
+            .to_atomic();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let fewest = crate::search::Search::new(&root, None, deadline, 1 << 20)
+            .solve(&root, 8)
+            .unwrap();
+        let mut search = together(&root, 3, split(4, 0));
+        search.set_most(fewest);
+        assert_eq!(search.solve(&root), Some(fewest));
+        assert_eq!(checked_length(&search, &root), fewest);
+        let mut search = together(&root, 3, split(4, 0));
+        search.set_most(fewest - 1);
+        assert_eq!(search.solve(&root), None);
+        assert_eq!(search.root_numbers.map(|(_, disproof)| disproof), Some(0));
+        assert!(!search.stopped);
+    }
+
+    /// Threads stop together at their node budget, which counts every
+    /// thread's nodes, and once told to stop.
+    #[test]
+    fn threads_stop_together() {
+        let root = Atomic::default();
+        let mut search = together(&root, 3, split(4, 0));
+        search.set_limit(100_000);
+        assert_eq!(search.solve(&root), None);
+        assert!(search.stopped, "{}", search.nodes);
+        assert!(
+            (100_000..100_000 + 3 * 4096).contains(&search.nodes),
+            "{}",
+            search.nodes
+        );
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let mut search = together(&root, 3, split(4, 0));
+        search.set_stop(&stop);
+        assert_eq!(search.solve(&root), None);
+        assert!(
+            search.stopped && search.nodes < 3 * 4096,
+            "{}",
+            search.nodes
+        );
+    }
+
+    /// Threads whose proofs fill drop their mates in one, once, while the
+    /// others wait, and go on to the win; proofs too small for it fill again
+    /// and stop them all, with no win claimed. A table of one cluster, whose
+    /// filter goes stale at every count, has them rebuild it while the
+    /// others wait, again and again.
+    #[test]
+    fn threads_share_their_changes() {
+        let root = from_fen("r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1")
+            .unwrap()
+            .to_atomic();
+        let mut search = together(&root, 4, split(4, 0));
+        Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::sized(4096, true);
+        search.set_drop_mates_at(0.05);
+        assert!(search.solve(&root).is_some());
+        assert!(search.mates_dropped.is_some() && !search.proofs_full());
+        checked_length(&search, &root);
+        let mut search = together(&root, 4, split(4, 0));
+        Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::new(0, true).unwrap();
+        assert_eq!(search.solve(&root), None);
+        assert!(search.proofs_full() && search.stopped && search.mates_dropped.is_some());
+        let mut search = together(&root, 4, (0, 4));
+        assert!(search.solve(&root).is_some());
+        checked_length(&search, &root);
+    }
+
+    /// Threads that find the table's filter a quarter set drop it while the
+    /// others wait, and each stops reading it.
+    #[test]
+    fn threads_drop_a_dense_filter() {
+        let root = Atomic::default();
+        let mut search = together(&root, 4, split(4, 0));
+        // A third of the filter's 2^20 bits, each position's check bits a bit
+        // of their own.
+        for i in 0..(1u32 << 20) / 3 {
+            let check = u64::from(i.wrapping_mul(0x9e37_79b9));
+            search.table().note(check << 32, true);
+        }
+        assert!(search.table().filter_is_dense() && search.filtering);
+        search.set_limit(20_000);
+        assert_eq!(search.solve(&root), None);
+        assert!(search.stopped && !search.table().filtering() && !search.filtering);
+    }
+
+    /// A seed for each thread: the threads' paths differ, and so do their
+    /// nodes, while what they prove does not.
+    #[test]
+    fn threads_search_with_seeds_of_their_own() {
+        let root = from_fen("r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1")
+            .unwrap()
+            .to_atomic();
+        for seed in [0, 7] {
+            let mut search = together(&root, 2, split(4, 0));
+            search.set_seed(seed);
+            assert!(search.solve(&root).is_some(), "{seed}");
+            checked_length(&search, &root);
+        }
+    }
+
+    /// A busy position's number grows by 1% for each thread below it, by at
+    /// least 1, and stays below infinity; a settled one's, or a number no
+    /// thread is below, stays as it is.
+    #[test]
+    fn crowding_grows_a_busy_number() {
+        assert_eq!(crowd(40, 0), 40);
+        assert_eq!(crowd(40, 1), 41);
+        assert_eq!(crowd(40, 3), 43);
+        assert_eq!(crowd(1, 2), 3);
+        assert_eq!(crowd(250, 1), 253);
+        assert_eq!(crowd(250, 2), 256);
+        assert_eq!(crowd(0, 3), 0);
+        assert_eq!(crowd(INFINITY, 3), INFINITY);
+        assert_eq!(crowd(INFINITY - 1, 1), INFINITY - 1);
+        assert_eq!(crowd(INFINITY / 2, 100), INFINITY - 1);
+    }
+
+    /// Together, a child is chosen, and its parent numbered, by the
+    /// children's deciding numbers as seen, while the other numbers sum as
+    /// they are; a child already dearer than the second best is not looked
+    /// at.
+    #[test]
+    fn combine_chooses_by_the_numbers_seen() {
+        let child = |proof, disproof| Child {
+            m: Default::default(),
+            hash: u64::from(proof),
+            counter: 0,
+            value: Value::open(Numbers { proof, disproof }),
+            exploded: false,
+            winning: false,
+            score: 0,
+            simulated: false,
+            fresh: false,
+            group: false,
+        };
+        let children = [child(10, 5), child(11, 7), child(30, 1)];
+        let (value, best, second) = combine(&children, true, |_, deciding| deciding);
+        assert_eq!((value.numbers.proof, value.numbers.disproof), (10, 13));
+        assert_eq!((best, second), (0, 11));
+        // Two threads below the first child: 10 is seen as 12.
+        let mut looked = Vec::new();
+        let (value, best, second) = combine(&children, true, |child, deciding| {
+            looked.push(deciding);
+            crowd(deciding, if child.hash == 10 { 2 } else { 0 })
+        });
+        assert_eq!((value.numbers.proof, value.numbers.disproof), (11, 13));
+        assert_eq!((best, second), (1, 12));
+        assert_eq!(looked, [10, 11]);
+        // Defending, the disproof numbers decide.
+        let (value, best, second) = combine(&children, false, |child, deciding| {
+            crowd(deciding, u16::from(child.hash == 30))
+        });
+        assert_eq!((value.numbers.proof, value.numbers.disproof), (51, 2));
+        assert_eq!((best, second), (2, 5));
     }
 }

@@ -32,6 +32,8 @@ use super::{Inputs, Options, parse, physical_mb};
 const HASH: usize = 1024;
 /// The most memory `Hash` may give, in MB.
 const MOST_HASH: usize = 1 << 20;
+/// The most threads `Threads` may give a search.
+const MOST_THREADS: usize = 1024;
 /// The time limit of a search without one: a year, as `provari prove` gives
 /// a search under a node budget alone. It also gives the proofs the most
 /// memory they may take (`dfpn::split`).
@@ -59,10 +61,10 @@ const COMMANDS: [&str; 11] = [
 type Out = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// `provari uci [OPTIONS]`: the options choose the guide, and give `Hash`
-/// (`--memory`), `SyzygyPath` (`--tablebases`), `Attacker` (`--attacker`) and
-/// `Shorten` (`--shorten`) their defaults; `--progress S` is how often a
-/// search prints its progress, every second by default. Each search's budget
-/// comes from its `go`.
+/// (`--memory`), `Threads` (`--threads`), `SyzygyPath` (`--tablebases`),
+/// `Attacker` (`--attacker`) and `Shorten` (`--shorten`) their defaults;
+/// `--progress S` is how often a search prints its progress, every second by
+/// default. Each search's budget comes from its `go`.
 pub fn run(args: &[String]) -> Result<(), String> {
     let (free, options) = parse(args)?;
     if !free.is_empty() {
@@ -214,6 +216,10 @@ impl Engine {
             format!("id name provari {}", env!("CARGO_PKG_VERSION")),
             "id author aiorla".to_owned(),
             format!("option name Hash type spin default {hash} min 1 max {MOST_HASH}"),
+            format!(
+                "option name Threads type spin default {} min 1 max {MOST_THREADS}",
+                self.options.threads
+            ),
             format!("option name SyzygyPath type string default {syzygy}"),
             format!(
                 "option name Attacker type combo default {attacker} var Mover var White var Black"
@@ -244,6 +250,12 @@ impl Engine {
             "hash" => match value.parse() {
                 Ok(mb) if (1..=MOST_HASH).contains(&mb) => self.options.memory = Some(mb),
                 _ => self.say(&format!("Hash is from 1 to {MOST_HASH} MB, not {value}")),
+            },
+            "threads" => match value.parse() {
+                Ok(threads) if (1..=MOST_THREADS).contains(&threads) => {
+                    self.options.threads = threads
+                }
+                _ => self.say(&format!("Threads is from 1 to {MOST_THREADS}, not {value}")),
             },
             "syzygypath" => self.open_tables(&value),
             "attacker" => match value.to_ascii_lowercase().as_str() {
@@ -763,6 +775,7 @@ mod tests {
         for option in [
             "option name Hash type spin default 16 min 1 max 1048576",
             "option name Hash type spin default 32 min 1 max 1048576",
+            "option name Threads type spin default 1 min 1 max 1024",
             "option name SyzygyPath type string default <empty>",
             "option name Attacker type combo default Mover var Mover var White var Black",
             "option name Shorten type check default false",
@@ -999,6 +1012,7 @@ mod tests {
     fn refuses_options_it_cannot_take() {
         let lines = session(&[
             "setoption name Hash value 0",
+            "setoption name Threads value 0",
             "setoption name Attacker value red",
             "setoption name Shorten value maybe",
             "setoption name UCI_Variant value chess",
@@ -1010,6 +1024,7 @@ mod tests {
             lines,
             [
                 "info string Hash is from 1 to 1048576 MB, not 0",
+                "info string Threads is from 1 to 1024, not 0",
                 "info string the attacker is Mover, White or Black, not red",
                 "info string Shorten is true or false, not maybe",
                 "info string provari proves Atomic wins only",

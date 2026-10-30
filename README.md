@@ -11,6 +11,8 @@ search that found it.
 
 - **Proof-number search**, guided by a model built on Atomic-Stockfish's
   neural network.
+- **Threads**: a search can use several cores, its threads sharing its
+  memory.
 - **Small proof files**: the 13-move win of the quick start below takes 657
   bytes.
 - **An independent checker**, which shares no code with the search.
@@ -94,6 +96,7 @@ write, it says what (`error`) and exits with 2.
 | `--seconds S` | 10 | The time budget. |
 | `--nodes N` | none | A node budget; with `--seconds`, whichever comes first. |
 | `--memory MB` | from the budget | Each search's memory: 192 MB for 10 s, 1.5 GB for 60 s. |
+| `--threads N` | 1 | Each search's threads, which share its memory; its default memory grows with them. |
 | `--max-memory MB` | half the machine's memory | The most memory the searches may take together. |
 | `--attacker white\|black` | the side to move | Whose win to prove. |
 | `--most N` | none | Only wins in at most N moves. |
@@ -149,6 +152,7 @@ best move is `0000`, and an `info string` says why.
 | Option | Default | What it does |
 |---|---|---|
 | `Hash` | 1024 | Each search's memory in MB. |
+| `Threads` | 1 | Each search's threads, which share its memory. |
 | `SyzygyPath` | empty | The tablebases' folders. |
 | `Attacker` | `Mover` | Whose win to search for: `Mover`, `White` or `Black`. |
 | `Shorten` | false | After a win, looks for shorter ones and reports each. |
@@ -174,7 +178,7 @@ found, of 200:
 
 | Program | 1 s | 10 s | 60 s |
 |---|---|---|---|
-| provari 0.1.0 | **12** | **25** | **39** |
+| provari 0.2.0 | **11** | **25** | **39** |
 | varifish 0.1.0 | 5 | 8 | 15 |
 | Atomic-Stockfish (38255c52, 2026-10-22) | 4 | 8 | 14 |
 | Multi-Variant Stockfish (3851b9df, 2019-11-06) | 4 | 9 | 16 |
@@ -218,11 +222,16 @@ Bash).
 
 For the browser, `web/build.sh [--tablebases DIR] [OUT]` builds the
 WebAssembly version into `web/dist` (or OUT), with `web/worker.js`, which
-runs it in a page's worker, and the data it loads. It needs the network and
-the model in `data/`, clang for zstd's C code,
-`rustup target add wasm32-unknown-unknown` and
+runs it in a page's worker and a search's other threads in workers of their
+own, and the data it loads. Its threads share memory, which browsers allow
+only on a cross-origin isolated page (served with
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`). It needs the network and the
+model in `data/`, clang for zstd's C code,
+`rustup target add wasm32-wasip1-threads` and
 `rustup component add llvm-tools`. `node web/compare.mjs` checks the browser
-build against the native one.
+build against the native one, with the worker running in Node
+(`web/node.mjs`).
 
 ## Acknowledgements
 

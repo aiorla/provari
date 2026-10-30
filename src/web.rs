@@ -9,12 +9,18 @@
 //!
 //! A worker loads what it needs once: the network, the model and the
 //! tables to prove positions; the tables alone to show positions, open
-//! proofs and check them. WebAssembly here runs on one thread, so a page
-//! that browses while it proves runs two workers. A proof's bytes stay here
+//! proofs and check them. A search's other threads each run in a worker of
+//! their own on this module's memory, which the page's worker starts before
+//! the search spawns them (`web/worker.js`). That worker is busy until the
+//! search ends, so a page that browses while it proves runs two, and stops a
+//! search through that worker's clock: the search ends, as at its deadline,
+//! once the flag at `stop_flag` is set, which the worker sets as the page
+//! asks it to when the search looks at the clock. A proof's bytes stay here
 //! after `prove` until `take_proof` fetches them.
 
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -55,6 +61,16 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+}
+
+/// Stops the running search, as its deadline does.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Where the stop flag is in this module's memory: a byte that the page's
+/// worker sets to 1 to stop the running search, and to 0 for the next.
+#[unsafe(no_mangle)]
+pub extern "C" fn stop_flag() -> *const AtomicBool {
+    &STOP
 }
 
 /// Memory for the page to write `len` bytes into, which the call it is
@@ -177,14 +193,16 @@ pub extern "C" fn open_tables() -> u64 {
 
 /// Proves a position: `{"fen", "attacker": "white" or "black", "seconds",
 /// "nodes", "memory_mb", "most": attacker moves, "progress": seconds,
-/// "shorten": true}`, all but the FEN optional (the attacker by default the
-/// side to move), guided by the strongest guide loaded. With `shorten`, after
-/// a win it looks for shorter ones within the same budget, handing the page
-/// the proof of each win shorter as written (`provari.found`), the first
-/// win's included, so that a page can show it at once and keeps the best
-/// if it stops the search. Replies as `provari prove` prints,
-/// the proof kept for `take_proof`, or with `{"error"}` alone for a request
-/// it refuses, such as one for more memory than the browser gives.
+/// "shorten": true, "threads"}`, all but the FEN optional (the attacker by
+/// default the side to move, one thread by default), guided by the strongest
+/// guide loaded. With `shorten`, after a win it looks for shorter ones within
+/// the same budget, handing the page the proof of each win shorter as written
+/// (`provari.found`), the first win's included, so that a page can show it at
+/// once and keeps the best if it stops the search. The search stops at its
+/// deadline, its budget or the stop flag (`stop_flag`). Replies as `provari
+/// prove` prints, the proof kept for `take_proof`, or with `{"error"}` alone
+/// for a request it refuses, such as one for more memory than the browser
+/// gives.
 ///
 /// # Safety
 ///
@@ -230,6 +248,13 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
         None => None,
     };
     let shorten = request["shorten"].as_bool().unwrap_or(false);
+    let threads = match request["threads"].as_u64() {
+        Some(threads) => usize::try_from(threads)
+            .ok()
+            .filter(|&threads| threads >= 1)
+            .ok_or("bad threads")?,
+        None => 1,
+    };
     let guide = match (&state.model, &state.network) {
         (Some(model), network) => Guide::Model(model, network.as_ref()),
         (None, Some(network)) => Guide::Network(network),
@@ -238,10 +263,14 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
     let tables = state.tables.as_ref();
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(seconds);
-    let split = dfpn::split(memory, dfpn::proofs_needed(Some(seconds), nodes));
-    let mut search = Dfpn::try_new(&root, tables, guide, deadline, split)
+    // As `provari prove --threads`: threads search as many times the nodes in
+    // the time, and share the memory.
+    let needed = dfpn::proofs_needed(Some(seconds * threads as f64), nodes);
+    let split = dfpn::split(memory, needed);
+    let mut search = Dfpn::try_with_threads(&root, tables, guide, deadline, split, threads)
         .map_err(|_| format!("This browser cannot give a search {memory} MB."))?;
     search.set_attacker(attacker);
+    search.set_stop(&STOP);
     if let Some(nodes) = nodes {
         search.set_limit(nodes);
     }
@@ -283,6 +312,9 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
         "nodes": search.nodes,
         "memory_mb": memory,
     });
+    if threads > 1 {
+        result["threads"] = json!(threads);
+    }
     if attacker != root.turn() {
         result["attacker"] = json!(side(attacker));
     }

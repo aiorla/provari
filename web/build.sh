@@ -1,8 +1,12 @@
 #!/bin/sh
-# Builds provari for the browser: the WebAssembly module, the worker that runs
-# it, and the data the worker loads: the network and the model, from data/ as
-# bundled builds take them, and the 3-4 piece tables of wins and losses from
-# the tablebases given, if any (1.2 MB, where the 5-piece ones take 0.4 GB).
+# Builds provari for the browser: the WebAssembly module, for WASI's threads,
+# the worker that runs it and its threads' workers on one shared memory, which
+# a page has only when cross-origin isolated (served with
+# `Cross-Origin-Opener-Policy: same-origin` and
+# `Cross-Origin-Embedder-Policy: require-corp`), and the data the worker
+# loads: the network and the model, from data/ as bundled builds take them,
+# and the 3-4 piece tables of wins and losses from the tablebases given, if
+# any (1.2 MB, where the 5-piece ones take 0.4 GB).
 # Into web/dist, or into the directory given. The module, the worker, the
 # network and the model are named after their contents, so that browsers never
 # mix two builds, each with a gzipped copy beside it (the network shrinks from
@@ -52,21 +56,34 @@ else
   echo "needs sha256sum or shasum" >&2
   exit 1
 fi
-# clang builds zstd's C code for WebAssembly, and LLVM's archiver indexes it.
+target=wasm32-wasip1-threads
+sysroot=$(rustc --print sysroot)
+# WASI's start for a library, whose `_initialize` the worker calls once, so
+# that the C library under Rust's threads knows its first thread.
+reactor="$sysroot/lib/rustlib/$target/lib/self-contained/crt1-reactor.o"
+if [ ! -f "$reactor" ]; then
+  echo "needs the target: rustup target add $target" >&2
+  exit 1
+fi
+# clang builds zstd's C code for WebAssembly, with zstd-sys's headers and its
+# own rather than the system's, and LLVM's archiver indexes it.
 host=$(rustc -vV | sed -n 's/host: //p')
-AR_wasm32_unknown_unknown="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-ar"
-if [ ! -x "$AR_wasm32_unknown_unknown" ]; then
+AR_wasm32_wasip1_threads="$sysroot/lib/rustlib/$host/bin/llvm-ar"
+if [ ! -x "$AR_wasm32_wasip1_threads" ]; then
   echo "needs LLVM's archiver: rustup component add llvm-tools" >&2
   exit 1
 fi
-export AR_wasm32_unknown_unknown
-# A 64 MB stack, as deep lines recurse deeply; and WebAssembly's SIMD. A second
-# build adds relaxed SIMD's dot product of bytes, for browsers that have it.
-stack="-C link-arg=-zstack-size=67108864"
-RUSTFLAGS="$stack -C target-feature=+simd128" \
-  cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib
-RUSTFLAGS="$stack -C target-feature=+simd128,+relaxed-simd" \
-  cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib \
+CFLAGS_wasm32_wasip1_threads=-nostdlibinc
+export AR_wasm32_wasip1_threads CFLAGS_wasm32_wasip1_threads
+# A 64 MB stack for the first thread, as deep lines recurse deeply (the others
+# take as much, crate::STACK); a memory of up to 4 GB, as large as the worker
+# gives; and WebAssembly's SIMD. A second build adds relaxed SIMD's dot product
+# of bytes, for browsers that have it.
+link="-C link-arg=-zstack-size=67108864 -C link-arg=--max-memory=4294967296 -C link-arg=$reactor"
+RUSTFLAGS="$link -C target-feature=+simd128" \
+  cargo rustc --lib --release --target $target --crate-type cdylib
+RUSTFLAGS="$link -C target-feature=+simd128,+relaxed-simd" \
+  cargo rustc --lib --release --target $target --crate-type cdylib \
   --target-dir target/relaxed
 
 mkdir -p "$out/tables"
@@ -80,8 +97,8 @@ named() {
   gzip -9 -k -n "$out/$2-$digest.$3"
   echo "$2-$digest.$3"
 }
-wasm=$(named target/wasm32-unknown-unknown/release/provari.wasm provari wasm)
-relaxed=$(named target/relaxed/wasm32-unknown-unknown/release/provari.wasm relaxed wasm)
+wasm=$(named target/$target/release/provari.wasm provari wasm)
+relaxed=$(named target/relaxed/$target/release/provari.wasm relaxed wasm)
 worker=$(named web/worker.js worker js)
 network=$(named data/network.nnue network nnue)
 model=$(named data/model.json model json)

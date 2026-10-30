@@ -12,6 +12,7 @@ pub mod lines;
 pub mod model;
 pub mod moves;
 pub mod nnue;
+pub mod pause;
 pub mod proofs;
 pub mod search;
 pub mod table;
@@ -26,7 +27,13 @@ use shakmaty::{
 };
 
 /// The stack of a search thread: deep lines recurse deeply.
+#[cfg(not(target_arch = "wasm32"))]
 pub const STACK: usize = 256 << 20;
+
+/// In WebAssembly, where every thread's stack comes out of one memory of 4 GB
+/// at most: as large as the first thread's (`web/build.sh`).
+#[cfg(target_arch = "wasm32")]
+pub const STACK: usize = 64 << 20;
 
 /// An Atomic position from its FEN, read as `from_setup` reads one.
 pub fn position(fen: &str) -> Result<Atomic, String> {

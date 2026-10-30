@@ -15,7 +15,10 @@
 //! search its memory, its table and its proofs, by default in proportion to
 //! its budget, as engines size their tables to the time control; the searches
 //! together may take at most `--max-memory MB`, by default half the machine's
-//! memory, or the prover refuses to start. `--progress SECONDS` prints how a
+//! memory, or the prover refuses to start. `--threads N` searches each
+//! position with N threads that share its memory, its default sized for N
+//! times the nodes in the time, and spread out over the tree so that each
+//! takes a line of its own (`dfpn`). `--progress SECONDS` prints how a
 //! search goes that often. Results report the budgets a search had. The
 //! strongest evaluation there is guides the search: a provability model
 //! (`--model FILE`), else Atomic-Stockfish's network (`--network FILE`), else
@@ -67,6 +70,8 @@ struct Options {
     nodes: Option<u64>,
     /// Perturbs each df-pn search's steps by up to 1%; 0 leaves them alone.
     seed: u64,
+    /// The threads each df-pn search takes, which share its memory.
+    threads: usize,
     /// The most attacker moves a win may take.
     most: Option<u32>,
     /// Each search's memory in MB, if not the default for its budget.
@@ -182,6 +187,7 @@ Commands:
 Main options:
   --seconds S, --nodes N   the budget, whichever comes first (10 s by default)
   --memory MB              each search's memory (by default, from its budget)
+  --threads N              each search's threads, which share its memory
   --attacker white|black   whose win to prove (by default, the side to move's)
   --most N                 only wins in at most N attacker moves
   --tablebases DIR[:DIR]   Lichess's Atomic Syzygy tables (.atbw), for endings
@@ -201,6 +207,7 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
         seconds: None,
         nodes: None,
         seed: 0,
+        threads: 1,
         most: None,
         memory: None,
         max_memory: None,
@@ -227,6 +234,10 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
             "--seconds" => options.seconds = Some(value()?.parse().map_err(|_| "bad --seconds")?),
             "--nodes" => options.nodes = Some(value()?.parse().map_err(|_| "bad --nodes")?),
             "--seed" => options.seed = value()?.parse().map_err(|_| "bad --seed")?,
+            "--threads" => match value()?.parse() {
+                Ok(threads) if threads >= 1 => options.threads = threads,
+                _ => return Err("--threads takes a number from 1".into()),
+            },
             "--most" => options.most = Some(value()?.parse().map_err(|_| "bad --most")?),
             "--memory" => options.memory = Some(value()?.parse().map_err(|_| "bad --memory")?),
             "--max-memory" => {
@@ -265,6 +276,9 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
     if options.shorten && options.search == "exhaustive" {
         return Err("--shorten is for df-pn: the baseline finds the shortest win itself".into());
     }
+    if options.threads > 1 && options.search == "exhaustive" {
+        return Err("--threads is for df-pn: the baseline searches with one".into());
+    }
     Ok((free, options))
 }
 
@@ -283,15 +297,18 @@ impl Options {
     /// where its budget needs it (`dfpn::proofs_needed`): a search stops
     /// when its proofs fill, once they have dropped their mates in one, while
     /// a full table costs little. So an hour has a 4 GB table and 5.4 GB of
-    /// proofs.
+    /// proofs. Its threads search as many times the nodes in its time, and
+    /// share its memory.
     fn memory(&self) -> (usize, usize) {
-        let needed = dfpn::proofs_needed(self.time_limit(), self.nodes);
+        let threads = self.threads as f64;
+        let seconds = self.time_limit().map(|seconds| seconds * threads);
+        let needed = dfpn::proofs_needed(seconds, self.nodes);
         if let Some(memory) = self.memory {
             return dfpn::split(memory, needed);
         }
         let filled = match self.nodes {
             Some(nodes) => nodes.div_ceil(50_000) as usize,
-            None => (self.seconds.unwrap_or(DEFAULT_SECONDS) * 10.0).ceil() as usize,
+            None => (self.seconds.unwrap_or(DEFAULT_SECONDS) * 10.0 * threads).ceil() as usize,
         };
         let table = filled.next_power_of_two().clamp(16, 4096);
         (table, (table / 2).max(needed))
@@ -328,6 +345,9 @@ impl Options {
             result["node_limit"] = json!(nodes);
         }
         result["memory_mb"] = json!(self.memory_mb());
+        if self.threads > 1 {
+            result["threads"] = json!(self.threads);
+        }
         if let Some(most) = self.most {
             result["most"] = json!(most);
         }
@@ -484,28 +504,8 @@ impl Inputs {
     }
 
     fn search(&self, root: &Atomic, attacker: Color, options: &Options) -> Dfpn<'_> {
-        let mut search = Dfpn::new(
-            root,
-            self.tablebase.as_ref(),
-            self.guide(options),
-            options.deadline(),
-            options.memory(),
-        );
-        search.set_attacker(attacker);
-        if let Some(nodes) = options.nodes {
-            search.set_limit(nodes);
-        }
-        if let Some(most) = options.most {
-            search.set_most(most);
-        }
-        if let Some(seconds) = options.progress {
-            search.set_progress(Duration::from_secs_f64(seconds));
-        }
-        search.set_seed(options.seed);
-        if let Some(share) = options.drop_mates_at {
-            search.set_drop_mates_at(share);
-        }
-        search
+        self.try_search(root, attacker, options)
+            .unwrap_or_else(|error| panic!("the search's memory: {error}"))
     }
 
     /// As `search`, unless the memory cannot be had, which `provari uci` says
@@ -516,12 +516,13 @@ impl Inputs {
         attacker: Color,
         options: &Options,
     ) -> Result<Dfpn<'_>, std::collections::TryReserveError> {
-        let mut search = Dfpn::try_new(
+        let mut search = Dfpn::try_with_threads(
             root,
             self.tablebase.as_ref(),
             self.guide(options),
             options.deadline(),
             options.memory(),
+            options.threads,
         )?;
         search.set_attacker(attacker);
         if let Some(nodes) = options.nodes {
@@ -1187,6 +1188,28 @@ mod tests {
         assert!(parse(&args(&["--attacker", "red"])).is_err());
     }
 
+    /// `--threads` searches with threads that share the memory: they find
+    /// the win one thread finds, and the result says how many. A search
+    /// takes at least one thread, the baseline only one.
+    #[test]
+    fn searches_with_threads() {
+        let args =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|arg| (*arg).to_owned()).collect() };
+        let inputs = Inputs {
+            tablebase: None,
+            network: None,
+            model: None,
+        };
+        let fen = "r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1";
+        let given = ["--nodes", "1000000", "--memory", "16", "--threads", "3"];
+        let (_, options) = parse(&args(&given)).unwrap();
+        let result = run(fen, None, &options, &inputs, None);
+        assert_eq!(result["found"], true, "{result}");
+        assert_eq!(result["threads"], 3);
+        assert!(parse(&args(&["--threads", "0"])).is_err());
+        assert!(parse(&args(&["--threads", "2", "--search", "exhaustive"])).is_err());
+    }
+
     /// The baseline finds the shortest win itself, so it refuses `--shorten`.
     #[test]
     fn shortens_only_proof_number_search() {
@@ -1342,6 +1365,17 @@ mod tests {
         assert_eq!(
             memory(&["--memory", "8000", "--nodes", "1000000000"]),
             (4096, 3904)
+        );
+        // Threads search as many times the nodes in the time, and share the
+        // memory.
+        assert_eq!(memory(&["--threads", "4"]), (512, 256));
+        assert_eq!(
+            memory(&["--threads", "8", "--seconds", "600"]),
+            (4096, 7200)
+        );
+        assert_eq!(
+            memory(&["--threads", "8", "--nodes", "32000000"]),
+            (1024, 512)
         );
     }
 }
