@@ -2,9 +2,10 @@
 //! time: the win-in-N baseline (`--search exhaustive`).
 //!
 //! A position is won when the attacker has a move after which every defence
-//! loses in fewer moves. Repeating a position on the current line counts as a
-//! draw, and so does reaching the 50-move limit, so every proof also holds
-//! under those rules.
+//! loses in fewer moves, and one the tablebases decide is won or not where it
+//! is reached, as a proof's length counts it (FORMAT.md). Repeating a position
+//! on the current line counts as a draw, and so does reaching the 50-move
+//! limit, so every proof also holds under those rules.
 
 use crate::clock::Instant;
 use std::collections::{HashMap, HashSet};
@@ -144,11 +145,15 @@ impl<'a> Search<'a> {
             None => {}
         }
         let legal = pos.legal_moves();
-        // A move that ends the game is tried before any deeper line.
+        // A move that ends the game, or reaches a position the tablebases
+        // lose for the defender, wins in one, and is tried before any deeper
+        // line.
         for m in &legal {
             let mut child = pos.clone();
             child.play_unchecked(*m);
-            if matches!(status(&child, self.attacker), Status::Won) {
+            if matches!(status(&child, self.attacker), Status::Won)
+                || self.probe(&child) == Some(Verdict::Loss)
+            {
                 self.record(key, *m, 1);
                 return true;
             }

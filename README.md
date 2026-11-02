@@ -123,7 +123,7 @@ without `--progress` a search keeps none.
 | `--threads N` | 1 | Each search's threads, which share its memory; its default memory grows with them. |
 | `--max-memory MB` | half the machine's memory | The most memory the searches may take together. |
 | `--attacker white\|black` | the side to move | Whose win to prove. |
-| `--most N` | none | Only wins in at most N moves. |
+| `--most N` | none | Only wins in at most N moves, a tablebase win counting where it is reached. |
 | `--shorten` | off | After a win, looks for shorter ones within the budget. |
 | `--tablebases DIR` | none | The tablebases' folders, separated by `:` (`;` on Windows). |
 | `--proofs PATH` | none | Where to write the proof (for `bench`, a folder). |
@@ -171,7 +171,8 @@ its lines once the proof wins within N moves, which keeps the tree small.
 searches for a win as `provari prove` does, limited by `mate N`, `nodes`,
 `movetime` or the clock, or with `infinite` until `stop`. A win is reported
 as a mate (`score mate N`), or as a tablebase win (`score cp`, 20000 less the
-line's plies) when its lines may end in the tablebases. Without a win the
+line's plies) when its lines may end in the tablebases, which under `mate N`
+they never do: that search plays tablebase wins out. Without a win the
 best move is `0000`, and an `info string` says why. While it searches, every
 second (`--progress S`), it sends the time, the nodes, their speed, how full
 its memory is, and the root move it has searched most (`currmove`); then the
@@ -253,7 +254,9 @@ Bash).
 For the browser, `web/build.sh [--tablebases DIR] [OUT]` builds the
 WebAssembly version into `web/dist` (or OUT), with `web/worker.js`, which
 runs it in a page's worker and a search's other threads in workers of their
-own, and the data it loads. Its threads share memory, which browsers allow
+own, and the data it loads, the tables in a folder named after their
+contents, which the worker fetches all at once when a proof or a search
+first needs them. Its threads share memory, which browsers allow
 only on a cross-origin isolated page (served with
 `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`). It needs the network and the

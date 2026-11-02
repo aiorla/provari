@@ -4,7 +4,7 @@
 //! the pointer in the low 32 bits and the length in the high ones, for the
 //! page to read and `release`), JSON requests and replies, and the page's
 //! clock and handlers imported (`provari.now_ms`; `provari.progress` for a
-//! search's progress lines, `provari.found` for each shorter win while it
+//! search's progress lines, `provari.found` for shorter wins while it
 //! shortens).
 //!
 //! A worker loads what it needs once: the network, the model and the
@@ -19,6 +19,7 @@
 //! after `prove` until `take_proof` fetches them.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -196,14 +197,16 @@ pub extern "C" fn open_tables() -> u64 {
 /// "shorten": true, "threads"}`, all but the FEN optional (the attacker by
 /// default the side to move, one thread by default), guided by the strongest
 /// guide loaded. With `shorten`, after a win it looks for shorter ones within
-/// the same budget, handing the page the proof of each win shorter as written
-/// (`provari.found`), the first win's included, so that a page can show it at
-/// once and keeps the best if it stops the search. The search stops at its
-/// deadline, its budget or the stop flag (`stop_flag`). Hands the page its
-/// progress lines as `provari prove --json --progress` prints them, and
-/// replies as `provari prove --json` prints, the proof kept for
-/// `take_proof`, or with `{"error"}` alone for a request it refuses, such as
-/// one for more memory than the browser gives.
+/// the same budget, handing the page the proofs of wins shorter as written
+/// (`provari.found`, `Handoff`): the first win's at once, so that a page can
+/// show it, and later ones at its progress lines, so that it keeps the best
+/// if it stops the search. The search stops at its deadline, its budget or
+/// the stop flag (`stop_flag`). Hands the page its progress lines as
+/// `provari prove --json --progress` prints them, and replies as
+/// `provari prove --json` prints, with when the last shorter win came
+/// (`mate_ms`), the proof of the best win kept for `take_proof`, which may be
+/// shorter than the last handed; or with `{"error"}` alone for a request it
+/// refuses, such as one for more memory than the browser gives.
 ///
 /// # Safety
 ///
@@ -288,25 +291,44 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
             }),
         );
     }
+    let handoff: Rc<RefCell<Option<Handoff>>> = Rc::default();
+    if shorten {
+        let waiting = handoff.clone();
+        search.set_progress_hook(Box::new(move |search| {
+            if let Some(handoff) = waiting.borrow_mut().as_mut()
+                && handoff.waiting
+                && handoff.due()
+            {
+                // Handed with the reply if not now.
+                let _ = handoff.hand(search);
+            }
+        }));
+    }
     let mut found = search.solve(&root);
     let mut shortened = None;
     if shorten && let Some(length) = found {
         let first_ms = started.elapsed().as_millis() as u64;
-        let (first, file) = proof_file(&search, &root, attacker, tables)?;
-        hand(&file);
-        // Only wins shorter as written, which can be shorter than the
-        // search's own length.
-        let mut handed = first.moves;
-        let shortening = search.shorten(&root, length, |search, _| {
-            if let Ok((header, file)) = proof_file(search, &root, attacker, tables)
-                && header.moves < handed
-            {
-                handed = header.moves;
-                hand(&file);
+        let mut first = Handoff {
+            root: root.clone(),
+            attacker,
+            tables,
+            handed: u32::MAX,
+            waiting: false,
+            started,
+            walked: Duration::ZERO,
+        };
+        first.hand(&search)?;
+        let first_moves = first.handed;
+        *handoff.borrow_mut() = Some(first);
+        let mut mate_ms = first_ms;
+        let shortening = search.shorten(&root, length, |_, _| {
+            mate_ms = started.elapsed().as_millis() as u64;
+            if let Some(handoff) = handoff.borrow_mut().as_mut() {
+                handoff.waiting = true;
             }
         });
         found = Some(shortening.length);
-        shortened = Some((first.moves, first_ms, shortening));
+        shortened = Some((first_moves, first_ms, mate_ms, shortening));
     }
     let mut result = json!({
         "found": found.is_some(),
@@ -341,9 +363,10 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
         result["line"] = json!(line);
         result["open"] = json!(open);
     }
-    if let Some((first, first_ms, shortening)) = shortened {
+    if let Some((first, first_ms, mate_ms, shortening)) = shortened {
         result["first_mate"] = json!(first);
         result["first_mate_ms"] = json!(first_ms);
+        result["mate_ms"] = json!(mate_ms);
         result["passes"] = json!(shortening.passes);
         result["shortest"] = json!(shortening.shortest);
     }
@@ -364,11 +387,7 @@ fn proof_file(
     attacker: Color,
     tables: Option<&Tablebase>,
 ) -> Result<(format::Header, Vec<u8>), String> {
-    let (header, indices) = format::walk(root, attacker, tables, |pos| {
-        search
-            .winning_move(&pos.to_atomic(), &(pos.hash(), pos.halfmoves()))
-            .and_then(|m| format::board_move(pos, &m))
-    })?;
+    let (header, indices) = format::walk(root, attacker, tables, |pos| search.proof_move(pos))?;
     let file = format::file(&header, &indices)?;
     Ok((header, file))
 }
@@ -377,6 +396,49 @@ fn proof_file(
 fn hand(file: &[u8]) {
     // SAFETY: the page reads the bytes before this returns.
     unsafe { found(file.as_ptr(), file.len()) };
+}
+
+/// How a shortening search hands the page its shorter wins. Each proof is
+/// written by a walk of the whole win, which holds up the search's thread
+/// and can take longer than the pass that found the win, as passes may find
+/// several wins a second. So the first is handed at once, and each later
+/// one at a progress line while the next pass runs, where the other threads
+/// search on (between passes they have all ended), as soon as the walks
+/// so far have taken at most a tenth of the search's time
+/// (`Dfpn::set_progress_hook`); one still waiting goes with the reply.
+struct Handoff<'a> {
+    root: Atomic,
+    attacker: Color,
+    tables: Option<&'a Tablebase>,
+    /// The shortest win handed, as written.
+    handed: u32,
+    /// Whether the search has found a win since the last walk.
+    waiting: bool,
+    /// When the search started, and how long its walks have taken.
+    started: Instant,
+    walked: Duration,
+}
+
+impl Handoff<'_> {
+    /// Whether the walks have taken at most a tenth of the search's time.
+    fn due(&self) -> bool {
+        self.walked * 10 <= self.started.elapsed()
+    }
+
+    /// Hands the page the search's win, if shorter as written than the one
+    /// handed before; one whose walk fails still waits.
+    fn hand(&mut self, search: &Dfpn) -> Result<(), String> {
+        let began = Instant::now();
+        let written = proof_file(search, &self.root, self.attacker, self.tables);
+        self.walked += began.elapsed();
+        let (header, file) = written?;
+        self.waiting = false;
+        if header.moves < self.handed {
+            self.handed = header.moves;
+            hand(&file);
+        }
+        Ok(())
+    }
 }
 
 /// The last proof written's bytes, in the compact format.
@@ -405,9 +467,8 @@ pub unsafe extern "C" fn check(ptr: *mut u8, len: usize) -> u64 {
 
 /// Opens a proof in the compact format for browsing, in place of the one
 /// open before: replies with its root, its attacker, the attacker moves it
-/// takes (`mate`), the moves it writes, the tablebases it declares, a
-/// longest line in UCI, and how many moves and comments its PGN tree writes
-/// (`pgn`).
+/// takes (`mate`), the moves it writes, the tablebases it declares, and a
+/// longest line in UCI.
 ///
 /// # Safety
 ///
@@ -424,7 +485,6 @@ pub unsafe extern "C" fn open_proof(ptr: *mut u8, len: usize) -> u64 {
         let (root, attacker, moves) = format::strategy(&header, &indices, tables)?;
         let mut proof = lines::Proof::new(attacker, moves);
         let (longest, _) = proof.longest_line(&root, tables)?;
-        let (moves, comments) = proof.pgn_size(&root, tables)?;
         let reply = json!({
             "root": header.root,
             "attacker": side(attacker),
@@ -432,7 +492,6 @@ pub unsafe extern "C" fn open_proof(ptr: *mut u8, len: usize) -> u64 {
             "positions": header.positions,
             "tablebases": header.tablebases,
             "longest": longest.iter().map(|&m| uci(m)).collect::<Vec<_>>(),
-            "pgn": { "moves": moves, "comments": comments },
         });
         state.open = Some((root, proof));
         Ok(reply)

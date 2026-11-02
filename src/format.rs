@@ -91,12 +91,10 @@ fn won_at_once(next: &Position, attacker: Color, capture: bool, check: bool) -> 
 }
 
 fn legal_moves(pos: &Position) -> Vec<Move> {
-    pos.pseudo_legal()
-        .as_slice()
-        .iter()
-        .copied()
-        .filter(|&m| pos.legal(m))
-        .collect()
+    let pseudo = pos.pseudo_legal();
+    let mut legal = Vec::with_capacity(pseudo.as_slice().len());
+    legal.extend(pseudo.as_slice().iter().copied().filter(|&m| pos.legal(m)));
+    legal
 }
 
 /// A move's number in the format's order: the square it leaves, the square it
@@ -220,30 +218,35 @@ impl<C: Chooser> Walk<'_, C> {
         if self.verdict(pos)? == Some(Verdict::Win) {
             return Ok((0, None));
         }
-        let mut moves: Vec<(Move, Position, bool)> = Vec::with_capacity(legal.len());
-        for m in legal {
+        // Checks first, then the format's order, which tells every move
+        // apart. The positions after the moves are made again where needed,
+        // which costs less than keeping them all.
+        let mut moves: Vec<(bool, u32, Move)> = Vec::with_capacity(legal.len());
+        for &m in &legal {
             let next = pos.play(m);
             let check = next.in_check();
             if won_at_once(&next, self.attacker, is_capture(pos, m), check) {
                 return Ok((1, Some(m)));
             }
-            moves.push((m, next, check));
+            moves.push((!check, number(pos, m), m));
         }
-        moves.sort_by_key(|(m, _, check)| (!*check, number(pos, *m)));
-        for (m, next, _) in moves.iter().take_while(|(_, _, check)| *check) {
+        moves.sort_unstable_by_key(|&(quiet, number, _)| (quiet, number));
+        for &(_, _, m) in moves.iter().take_while(|&&(quiet, ..)| !quiet) {
             let decided = self.decided.get();
-            if let Some(length) = self.wins_in_two(next)? {
-                return Ok((length, Some(*m)));
+            if let Some(length) = self.wins_in_two(&pos.play(m))? {
+                return Ok((length, Some(m)));
             }
             // A check that does not win in two would not with fewer tables
             // either, so the verdicts met in its lines are not the proof's.
             self.decided.set(decided);
         }
-        let ordered: Vec<Move> = moves.iter().map(|(m, ..)| *m).collect();
-        let index = self.chooser.choose(pos, &ordered)?;
-        let (m, next, _) = &moves[index];
-        let replies = legal_moves(next);
-        Ok((1 + self.defender_to_move(next, replies)?, Some(*m)))
+        let mut ordered = legal;
+        ordered.clear();
+        ordered.extend(moves.iter().map(|&(.., m)| m));
+        let m = ordered[self.chooser.choose(pos, &ordered)?];
+        let next = pos.play(m);
+        let replies = legal_moves(&next);
+        Ok((1 + self.defender_to_move(&next, replies)?, Some(m)))
     }
 
     /// Whether a check leaves the defender lost at once whatever it does,
@@ -301,7 +304,8 @@ impl<C: Chooser> Walk<'_, C> {
             return Err(format!("a line repeats {}", fen(pos)));
         }
         let mut replies = replies;
-        replies.sort_by_key(|&m| number(pos, m));
+        // No two moves share a number.
+        replies.sort_unstable_by_key(|&m| number(pos, m));
         let mut longest = 0;
         for reply in replies {
             let next = pos.play(reply);

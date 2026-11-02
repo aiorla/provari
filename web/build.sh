@@ -10,7 +10,9 @@
 # Into web/dist, or into the directory given. The module, the worker, the
 # network and the model are named after their contents, so that browsers never
 # mix two builds, each with a gzipped copy beside it (the network shrinks from
-# 48 to 27 MB); manifest.json names them, and a page fetches it fresh.
+# 48 to 27 MB), and the tables are in a folder named after theirs, so that
+# browsers may keep them all; manifest.json names them, and a page fetches it
+# fresh.
 # Usage: web/build.sh [--tablebases DIR] [OUT]
 set -e
 usage() {
@@ -86,9 +88,10 @@ RUSTFLAGS="$link -C target-feature=+simd128,+relaxed-simd" \
   cargo rustc --lib --release --target $target --crate-type cdylib \
   --target-dir target/relaxed
 
-mkdir -p "$out/tables"
+mkdir -p "$out"
 rm -f "$out"/provari-*.wasm* "$out"/relaxed-*.wasm* "$out"/worker-*.js* "$out"/network-*.nnue* \
-  "$out"/model-*.json* "$out"/manifest.json "$out"/tables/*
+  "$out"/model-*.json* "$out"/manifest.json
+rm -rf "$out"/tables "$out"/tables-*
 # Copies a file under its name with a digest of its contents, with a gzipped
 # copy beside it for servers that send it compressed, and prints the name.
 named() {
@@ -103,7 +106,9 @@ worker=$(named web/worker.js worker js)
 network=$(named data/network.nnue network nnue)
 model=$(named data/model.json model json)
 tables=
+folder=
 if [ -n "$tablebases" ]; then
+  mkdir "$out/tables"
   for table in "$tablebases"/*.atbw; do
     name=$(basename "$table")
     pieces=$(printf %s "${name%.*}" | tr -d v | wc -c)
@@ -116,10 +121,15 @@ if [ -n "$tablebases" ]; then
     echo "no tables of 3 or 4 pieces (.atbw) in $tablebases" >&2
     exit 1
   fi
+  # The folder's name: a digest of its tables' digests and names, sorted, so
+  # that it changes only with them.
+  folder=tables-$(cd "$out/tables" && for table in *.atbw; do echo "$(sha256 "$table") $table"; done |
+    LC_ALL=C sort | sha256 - | cut -c1-12)
+  mv "$out/tables" "$out/$folder"
 fi
 # The network's size as a page receives it, decompressed, for its progress.
 network_bytes=$(wc -c < "$out/$network" | tr -d ' ')
 cat > "$out/manifest.json" <<JSON
-{"wasm": "$wasm", "relaxed": "$relaxed", "worker": "$worker", "network": "$network", "network_bytes": $network_bytes, "model": "$model", "tables": [$tables]}
+{"wasm": "$wasm", "relaxed": "$relaxed", "worker": "$worker", "network": "$network", "network_bytes": $network_bytes, "model": "$model", "tables_folder": "$folder", "tables": [$tables]}
 JSON
 ls -la "$out/$wasm"

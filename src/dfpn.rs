@@ -50,7 +50,9 @@
 //! know their lengths, so one counts wherever it fits the moves left; the
 //! table keeps what it learns apart for each number of moves left, since a
 //! position refuted for lack of moves may be won with more. A tablebase win
-//! says nothing of its length, so a limited search plays it out.
+//! counts as won where it is reached, as a proof's length counts it
+//! (FORMAT.md), with any moves left; an exact search plays it out instead,
+//! so that its every line ends in a mate or an explosion (`set_exact`).
 //!
 //! Threads may search a position together (`try_with_threads`), as chess
 //! engines' threads do (Lazy SMP): they share the table and the proofs, each
@@ -187,6 +189,10 @@ impl<'a> Guide<'a> {
 
 /// Where progress lines go instead of standard error.
 pub type ProgressSink = Box<dyn FnMut(&serde_json::Value)>;
+
+/// What runs with the search after each progress line while it goes on
+/// (`set_progress_hook`).
+pub type ProgressHook<'a> = Box<dyn FnMut(&Dfpn<'_>) + 'a>;
 
 /// A search's progress lines: how often, the next one, when the search
 /// started, the time and nodes at the last line, and where they go if not
@@ -399,6 +405,7 @@ struct Settings<'a> {
     limit: u64,
     drop_mates_at: usize,
     most: Option<u32>,
+    exact: bool,
     root_attacking: bool,
 }
 
@@ -459,6 +466,7 @@ pub struct Dfpn<'a> {
     drop_mates_at: usize,
     /// When and how to print progress lines, if at all.
     progress: Option<Progress>,
+    hook: Option<ProgressHook<'a>>,
     /// The root's proof and disproof numbers as the search last combined them.
     root: (u32, u32),
     /// Whether the search keeps its line and its root moves' nodes: while it
@@ -477,6 +485,8 @@ pub struct Dfpn<'a> {
     seed: u64,
     /// The most attacker moves a win may take, if limited.
     most: Option<u32>,
+    /// Whether tablebase wins are played out (`set_exact`).
+    exact: bool,
     /// Whether the attacker is to move at the root, which tells the line's
     /// attacker moves from its plies.
     root_attacking: bool,
@@ -552,6 +562,7 @@ impl<'a> Dfpn<'a> {
             limit: u64::MAX,
             drop_mates_at: usize::MAX,
             most: None,
+            exact: false,
             root_attacking: true,
         };
         Ok(Dfpn::with_store(Arc::new(store), settings))
@@ -588,6 +599,7 @@ impl<'a> Dfpn<'a> {
             full: false,
             drop_mates_at: settings.drop_mates_at,
             progress: None,
+            hook: None,
             root: (1, 1),
             keeping: false,
             levels: [Level::default(); LINE],
@@ -597,6 +609,7 @@ impl<'a> Dfpn<'a> {
             peak: 0,
             seed: 0,
             most: settings.most,
+            exact: settings.exact,
             root_attacking: settings.root_attacking,
             nodes: 0,
             stopped: false,
@@ -619,6 +632,7 @@ impl<'a> Dfpn<'a> {
             limit: self.limit,
             drop_mates_at: self.drop_mates_at,
             most: self.most,
+            exact: self.exact,
             root_attacking: self.root_attacking,
         }
     }
@@ -657,6 +671,13 @@ impl<'a> Dfpn<'a> {
         self.most = Some(moves);
     }
 
+    /// Plays tablebase wins out rather than count them as won where they are
+    /// reached, so that every line of a win ends in a mate or an explosion
+    /// and its length is exact, as `go mate` asks; the tables still refute.
+    pub fn set_exact(&mut self) {
+        self.exact = true;
+    }
+
     /// Prints a progress line every `every` (see `report`), keeping the
     /// search's line for it.
     pub fn set_progress(&mut self, every: Duration) {
@@ -678,6 +699,13 @@ impl<'a> Dfpn<'a> {
         if let Some(progress) = &mut self.progress {
             progress.sink = Some(sink);
         }
+    }
+
+    /// Runs `hook` with the search after each progress line, unless the
+    /// search has stopped: for what reads its proofs while it goes on, as
+    /// the browser build writes a shorter win's proof for its page.
+    pub fn set_progress_hook(&mut self, hook: ProgressHook<'a>) {
+        self.hook = Some(hook);
     }
 
     /// Keeps the search's line without reporting it, for `line` once the
@@ -737,21 +765,34 @@ impl<'a> Dfpn<'a> {
         self.puts = 0;
         let settings = self.settings();
         let numbers = std::thread::scope(|scope| {
+            let mut helpers = Vec::new();
             for thread in 1..store.threads {
                 let part = Part::new(&store);
                 let (shared, seed) = (Arc::clone(&store), self.seed);
                 let helper = std::thread::Builder::new().stack_size(crate::STACK);
                 // A thread that cannot start drops its part: the others search
                 // without it.
-                let _ = helper.spawn_scoped(scope, move || {
+                let started = helper.spawn_scoped(scope, move || {
                     let _part = part;
                     let mut search = Dfpn::with_store(shared, settings);
                     search.seed = seed.wrapping_add(SEED_SPREAD.wrapping_mul(thread as u64));
                     search.search_root(root)
                 });
+                helpers.extend(started.ok());
             }
-            let _part = Part::new(&store);
-            self.search_root(root)
+            let numbers = {
+                let _part = Part::new(&store);
+                self.search_root(root)
+            };
+            // Joined, as the scope's end does not: it waits for the threads'
+            // work, and a thread joined has exited too, which the browser
+            // build's next spawn may wait for (web/worker.js).
+            for helper in helpers {
+                if let Err(panic) = helper.join() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            numbers
         });
         // The others may have changed the filter after this thread left.
         self.filtering = store.table.filtering();
@@ -840,6 +881,15 @@ impl<'a> Dfpn<'a> {
             None => self.dropped_mate(&pos)?,
         };
         Some(pos.to_shakmaty(m))
+    }
+
+    /// `winning_move` on the board a proof's walk plays (`format::walk`),
+    /// with no position or move to convert.
+    pub fn proof_move(&self, pos: &Position) -> Option<Move> {
+        match self.proof_at(pos.hash(), pos.halfmoves()) {
+            Some(proof) => proof.m,
+            None => self.dropped_mate(pos),
+        }
     }
 
     /// Has the proofs drop their mates in one once they hold this share of
@@ -1196,16 +1246,23 @@ impl<'a> Dfpn<'a> {
 
     /// `children` for an attacker position with one move left, where only a
     /// move that wins at once counts: a plain move neither captures nor
-    /// checks, so it cannot and is left out, and every other child is decided
-    /// where it is scored, so nothing needs the position's evaluation. Apart
-    /// from `children`, so that searches without a limit run the same code.
+    /// checks, so it cannot and is left out, unless a pawn move may reach a
+    /// tablebase win; every other child is decided where it is scored, so
+    /// nothing needs the position's evaluation. Apart from `children`, so
+    /// that searches without a limit run the same code.
     #[inline(never)]
     fn last_children(&mut self, pos: &Position, mover: &Mover, children: &mut Vec<Child>) {
         let mut legal = std::mem::take(&mut self.scratch);
         legal.clear();
         let filtering = self.filtering;
+        let tables = !self.exact
+            && self
+                .tablebase
+                .is_some_and(|tables| pos.occupied().count() <= tables.max_pieces());
         for &m in pos.pseudo_legal().as_slice() {
-            if mover.plain(m) || !mover.legal(m) {
+            let kept =
+                !mover.plain(m) || tables && pos.role_at(m.from()) == Some(shakmaty::Role::Pawn);
+            if !kept || !mover.legal(m) {
                 continue;
             }
             let effect = mover.full_effect(m);
@@ -1557,6 +1614,14 @@ impl<'a> Dfpn<'a> {
         if seen && self.proof_within(hash, counter, remaining).is_some() {
             return child(Value::WON, false);
         }
+        // The tables decide a child reached by a capture or pawn move, with
+        // any moves left.
+        if counter == 0
+            && self.tablebase.is_some()
+            && let Some(value) = self.tablebase_value(pos, m, effect, key, seen)
+        {
+            return child(value, false);
+        }
         // Out of attacker moves, only a mate still wins.
         if remaining == 0 {
             let mated = mover.gives_check(m, effect)
@@ -1584,30 +1649,6 @@ impl<'a> Dfpn<'a> {
         } else {
             None
         };
-        if let Some(value) = known
-            && value.numbers.disproof == 0
-        {
-            return child(value, false);
-        }
-        if counter == 0
-            && let Some(tables) = self.tablebase
-            && effect.occupied.count() <= tables.max_pieces()
-            && let Some(verdict) = tables.probe(&pos.play(m).to_atomic())
-        {
-            let attacker_wins = if pos.turn() == self.attacker {
-                verdict == Verdict::Loss
-            } else {
-                verdict == Verdict::Win
-            };
-            if !attacker_wins {
-                self.store(key, counter, Value::DRAWN, 0);
-                return child(Value::DRAWN, false);
-            }
-            if self.most.is_none() {
-                self.add_proof(hash, Proof::TABLEBASE);
-                return child(Value::WON, false);
-            }
-        }
         if let Some(value) = known {
             return child(value, false);
         }
@@ -1669,6 +1710,45 @@ impl<'a> Dfpn<'a> {
             fresh: true,
             ..child(Value::open(Numbers { proof, disproof: 1 }), false)
         }
+    }
+
+    /// A child reached by a capture or pawn move as the tablebases score it,
+    /// where they hold it: won, its proof kept, with any moves left, unless
+    /// the search is exact; otherwise refuted, as the table then keeps it
+    /// for these moves left, so that the tables are read once.
+    fn tablebase_value(
+        &mut self,
+        pos: &Position,
+        m: Move,
+        effect: &Effect,
+        key: u64,
+        seen: bool,
+    ) -> Option<Value> {
+        let tables = self.tablebase?;
+        if effect.occupied.count() > tables.max_pieces() {
+            return None;
+        }
+        if seen
+            && let Some(value) = self.lookup(key, 0, |_| false)
+            && value.numbers.disproof == 0
+        {
+            return Some(value);
+        }
+        let verdict = tables.probe(&pos.play(m).to_atomic())?;
+        let attacker_wins = if pos.turn() == self.attacker {
+            verdict == Verdict::Loss
+        } else {
+            verdict == Verdict::Win
+        };
+        if !attacker_wins {
+            self.store(key, 0, Value::DRAWN, 0);
+            return Some(Value::DRAWN);
+        }
+        if self.exact {
+            return None;
+        }
+        self.add_proof(effect.hash, Proof::TABLEBASE);
+        Some(Value::WON)
     }
 
     /// The depth of a child's position on the current line, if it repeats
@@ -2639,6 +2719,12 @@ impl<'a> Dfpn<'a> {
             Some(sink) => sink(&record),
             None => eprintln!("{record}"),
         }
+        if !self.stopped
+            && let Some(mut hook) = self.hook.take()
+        {
+            hook(self);
+            self.hook = Some(hook);
+        }
     }
 }
 
@@ -2984,11 +3070,23 @@ mod tests {
         perturb_model_step, scale, share, split,
     };
     use crate::board::from_fen;
+    use crate::tablebase::Tablebase;
 
     /// The length of a search's win as `provari prove` writes its proof, in
     /// the compact format, which the checker confirms.
     fn checked_length(search: &Dfpn, root: &Atomic) -> u32 {
-        let (header, indices) = crate::format::walk(root, root.turn(), None, |pos| {
+        checked_length_with(search, root, None)
+    }
+
+    /// `checked_length` with tablebases: the prover's, and the same as the
+    /// checker reads them.
+    fn checked_length_with(
+        search: &Dfpn,
+        root: &Atomic,
+        tables: Option<(&Tablebase, &shakmaty_syzygy::Tablebase<Atomic>)>,
+    ) -> u32 {
+        let prover = tables.map(|(prover, _)| prover);
+        let (header, indices) = crate::format::walk(root, root.turn(), prover, |pos| {
             let key = (pos.hash(), pos.halfmoves());
             search
                 .winning_move(&pos.to_atomic(), &key)
@@ -2996,7 +3094,8 @@ mod tests {
         })
         .unwrap();
         let bytes = crate::format::file(&header, &indices).unwrap();
-        let checked = crate::check::check_proof("proof", &bytes, None);
+        let checker = tables.map(|(_, checker)| checker);
+        let checked = crate::check::check_proof("proof", &bytes, checker);
         assert_eq!(checked["valid"], true, "{checked}");
         header.moves
     }
@@ -3329,6 +3428,72 @@ mod tests {
                 assert_eq!(found, None, "{fen}");
                 assert_eq!(numbers.map(|(_, disproof)| disproof), Some(0), "{fen}");
             }
+        }
+    }
+
+    /// With the tablebases, a win counts as won where it reaches one: under a
+    /// limit the search agrees with the exhaustive baseline, which counts
+    /// them the same way, on whether a win exists within one, two and three
+    /// moves, and its proof reads back no longer; shortening brings a first
+    /// win down to the baseline's fewest. An exact search agrees with the
+    /// baseline without the tables, which plays every line out. In
+    /// positions of five pieces past a capture or pawn move, where the
+    /// tables decide what captures and pawn moves reach, quiet pawn moves in
+    /// the last; with the tables up to five pieces in `PROVARI_TABLEBASES`
+    /// (a list as `PATH` is):
+    /// `cargo test --release -- --ignored counts_tablebase_wins_as_reached`.
+    #[test]
+    #[ignore = "needs the tablebases"]
+    fn counts_tablebase_wins_as_reached() {
+        let path = std::env::var_os("PROVARI_TABLEBASES").expect("PROVARI_TABLEBASES");
+        let tables = Tablebase::open(std::path::Path::new(&path)).unwrap();
+        let mut checker = shakmaty_syzygy::Tablebase::<Atomic>::new();
+        for directory in std::env::split_paths(&path) {
+            checker.add_directory(directory).unwrap();
+        }
+        for fen in [
+            // A pawn takes the knight, which leaves the queen.
+            "7k/8/8/3n4/4P3/8/8/K5Q1 w - - 3 1",
+            // A pawn takes the rook.
+            "8/8/5k2/8/2r5/3P4/8/K3Q3 w - - 3 1",
+            // Quiet pawn moves reach the tables.
+            "k7/1n6/8/8/8/8/6P1/K2Q4 w - - 3 1",
+        ] {
+            let root = from_fen(fen).unwrap().to_atomic();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            for most in 1..=3 {
+                for exact in [false, true] {
+                    let seen = (!exact).then_some(&tables);
+                    let baseline = crate::search::Search::new(&root, seen, deadline, 1 << 20)
+                        .solve(&root, most);
+                    let mut search =
+                        Dfpn::new(&root, Some(&tables), Guide::Hand, deadline, split(16, 0));
+                    if exact {
+                        search.set_exact();
+                    }
+                    search.set_most(most);
+                    let found = search.solve(&root);
+                    let case = format!("{fen} within {most}, exact {exact}");
+                    assert_eq!(found.is_some(), baseline.is_some(), "{case}");
+                    if found.is_some() {
+                        let read = seen.map(|tables| (tables, &checker));
+                        assert!(checked_length_with(&search, &root, read) <= most, "{case}");
+                    }
+                }
+            }
+            let mut search = Dfpn::new(&root, Some(&tables), Guide::Hand, deadline, split(16, 0));
+            let first = search.solve(&root).unwrap();
+            let shortening = search.shorten(&root, first, |_, _| {});
+            let fewest = crate::search::Search::new(&root, Some(&tables), deadline, 1 << 20)
+                .solve(&root, first)
+                .unwrap();
+            assert_eq!(
+                (shortening.length, shortening.shortest),
+                (fewest, true),
+                "{fen}"
+            );
+            let read = Some((&tables, &checker));
+            assert_eq!(checked_length_with(&search, &root, read), fewest, "{fen}");
         }
     }
 

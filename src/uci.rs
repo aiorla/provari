@@ -3,7 +3,8 @@
 //! answers on standard output: `uci`, `isready`, `setoption`, `ucinewgame`,
 //! `position`, `go`, `stop`, `ponderhit` and `quit`. Each `go` runs one search
 //! as `provari prove` does, in a thread of its own so that `isready` and
-//! `stop` are answered meanwhile: `go mate N` is `--most N`, `nodes` and
+//! `stop` are answered meanwhile: `go mate N` is `--most N` with tablebase
+//! wins played out, so that a mate's length is exact, `nodes` and
 //! `movetime` or the clock budget it, and `infinite`, or no limit, searches
 //! until it settles the position or is stopped. A win is reported as engines
 //! report mates, with a longest line of its proof as the principal variation
@@ -495,8 +496,8 @@ struct Job {
     options: Options,
     started: Instant,
     deadline: Instant,
-    /// Under `go mate`, where the search plays tablebase wins out, its proofs
-    /// need no tables, and their lengths are exact.
+    /// Under `go mate`, where the search plays tablebase wins out
+    /// (`set_exact`), its proofs need no tables, and their lengths are exact.
     exact: bool,
     /// How often the search prints its progress, if at all.
     every: Option<Duration>,
@@ -547,6 +548,9 @@ impl Job {
         // The GUI's clock runs from `go`, before the memory is set up.
         search.set_deadline(self.deadline);
         search.set_stop(stop);
+        if self.exact {
+            search.set_exact();
+        }
         let started = self.started;
         if let Some(every) = self.every {
             let (progress_out, from, currline) = (out.clone(), root.clone(), self.currline);

@@ -3,8 +3,6 @@
 //! longest line, and the proof's tree as PGN; and for the page, how many
 //! attacker moves the proof takes from any position it covers.
 
-use std::collections::HashMap;
-
 use serde_json::{Value, json};
 use shakmaty::san::{San, SanPlus};
 use shakmaty::{
@@ -236,89 +234,6 @@ impl Proof {
             next.play_unchecked(m);
             matches!(search::status(&next, self.attacker), search::Status::Won)
         }))
-    }
-
-    /// How many moves and comments the PGN tree from `pos` writes, its lines
-    /// ending where the proof wins within `until` attacker moves, counted on
-    /// the proof's positions rather than written: the tree writes a position
-    /// again on every line that reaches it, so it can be far larger than the
-    /// proof.
-    fn tree_size(
-        &mut self,
-        pos: &Atomic,
-        tablebase: Option<&Tablebase>,
-        until: Option<u32>,
-        counted: &mut HashMap<u64, (u64, u64)>,
-    ) -> Result<(u64, u64), String> {
-        if !self.open(pos) {
-            return Ok((0, 0));
-        }
-        let key = search::hash(pos);
-        if let Some(&size) = counted.get(&key) {
-            return Ok(size);
-        }
-        let play = |pos: &Atomic, m| {
-            let mut next = pos.clone();
-            next.play_unchecked(m);
-            next
-        };
-        let short = |length: u32| until.is_some_and(|until| length <= until);
-        let size = if pos.turn() == self.attacker {
-            match self.proof_move(pos, tablebase)? {
-                Some(m) => {
-                    let (moves, comments) =
-                        self.tree_size(&play(pos, m), tablebase, until, counted)?;
-                    (moves + 1, comments)
-                }
-                // "{tablebase win}"
-                None => (0, 1),
-            }
-        } else {
-            let replies = self.replies(pos, tablebase)?;
-            match replies.first() {
-                Some(&(lasts, main)) => {
-                    let (mut moves, mut comments) = (1, 0);
-                    let mut others = 0;
-                    for &(length, reply) in &replies[1..] {
-                        let next = play(pos, reply);
-                        if self.wins_at_once(&next, tablebase)? {
-                            continue;
-                        }
-                        // The defence and its "{mate in N}", and its line.
-                        others += 1;
-                        moves += 1;
-                        comments += 1;
-                        if !short(length) {
-                            let (m, c) = self.tree_size(&next, tablebase, until, counted)?;
-                            moves += m;
-                            comments += c;
-                        }
-                    }
-                    // The main line's "{mate in N}".
-                    if others > 0 || short(lasts) {
-                        comments += 1;
-                    }
-                    if !short(lasts) {
-                        let (m, c) = self.tree_size(&play(pos, main), tablebase, until, counted)?;
-                        moves += m;
-                        comments += c;
-                    }
-                    (moves, comments)
-                }
-                None => (0, 1),
-            }
-        };
-        counted.insert(key, size);
-        Ok(size)
-    }
-
-    /// How many moves and comments the whole PGN tree from `pos` writes.
-    pub fn pgn_size(
-        &mut self,
-        pos: &Atomic,
-        tablebase: Option<&Tablebase>,
-    ) -> Result<(u64, u64), String> {
-        self.tree_size(pos, tablebase, None, &mut HashMap::new())
     }
 
     /// The whole tree from `root` as a PGN game, as `provari line --pgn`
@@ -553,25 +468,12 @@ mod tests {
         next
     }
 
-    /// The PGN tree's moves and comments counted on the proof's positions
-    /// are those it writes, wherever its lines end.
+    /// The page's PGN tree is the one `provari line --pgn` writes.
     #[test]
-    fn counts_the_moves_the_tree_writes() {
+    fn writes_the_tree_as_the_line_command() {
         let (_, bytes) = encode_jsonl(SMALL, None).unwrap();
         let (header, indices) = decode(&bytes).unwrap().unwrap();
         let (root, attacker, moves) = strategy(&header, &indices, None).unwrap();
-        for until in [None, Some(0), Some(1), Some(2), Some(3)] {
-            let (shown, pgn) =
-                super::show(root.clone(), attacker, moves.clone(), None, "", true, until).unwrap();
-            let mut proof = Proof::new(attacker, moves.clone());
-            let (counted, comments) = proof
-                .tree_size(&root, None, until, &mut std::collections::HashMap::new())
-                .unwrap();
-            assert_eq!(shown["pgn_moves"], counted, "until {until:?}");
-            // The comments but the one that opens the tree.
-            let written = pgn.unwrap().matches('{').count() as u64 - 1;
-            assert_eq!(written, comments, "until {until:?}");
-        }
         let mut proof = Proof::new(attacker, moves.clone());
         let (shown, pgn) =
             super::show(root.clone(), attacker, moves, None, "", true, None).unwrap();

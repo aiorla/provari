@@ -95,7 +95,7 @@ failures.onmessage = ({ data }) => {
   console.log(`a thread failed: ${data}`);
   process.exit(1);
 };
-const tables = join(dist, "tables");
+const tables = join(dist, manifest.tables_folder || "tables");
 
 const moves = (proof) => zstdDecompressSync(proof.subarray(proof.indexOf(10) + 1));
 const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -172,11 +172,12 @@ for (const [fen, most] of [[positions[1], 13], [positions[1], 9], [positions[2],
     `nodes ${ours.nodes}/${theirs.nodes}, mate ${ours.mate}/${theirs.mate}`);
 }
 // Shortening a win: the same lengths, passes and nodes as natively, every
-// proof handed over valid and each shorter than the one before.
+// proof handed over valid and each shorter than the one before, the later
+// ones at progress lines.
 const header = (bytes) => JSON.parse(decoder.decode(bytes.subarray(0, bytes.indexOf(10))));
 for (const fen of [positions[0], positions[1]]) {
   handed.length = 0;
-  const ours = must(await request("prove", { request: { fen, nodes, memory_mb: memory, shorten: true } }));
+  const ours = must(await request("prove", { request: { fen, nodes, memory_mb: memory, shorten: true, progress: 0.05 } }));
   const theirs = run("prove", fen, "--json", "--nodes", String(nodes), "--memory", String(memory), "--shorten", ...inputs);
   const lengths = handed.map((proof) => header(proof).moves);
   let valid = true;
@@ -248,7 +249,7 @@ for (const threads of [2, 4]) {
 if (proven.length > 0) {
   handed.length = 0;
   const ours = must(await request("prove", {
-    request: { fen: proven.at(-1), nodes: 2 * nodes, memory_mb: memory, shorten: true, threads: 2 },
+    request: { fen: proven.at(-1), nodes: 2 * nodes, memory_mb: memory, shorten: true, threads: 2, progress: 0.05 },
   }));
   const lengths = handed.map((proof) => header(proof).moves);
   let valid = ours.found && lengths[0] === ours.first_mate && lengths.at(-1) >= ours.mate &&

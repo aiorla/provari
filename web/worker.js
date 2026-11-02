@@ -3,7 +3,9 @@
 // {id, type, ...} and gets back {id, result} or {id, error}, with `fatal`
 // once the module can no longer be trusted; a search reports {progress}
 // as it goes, and while it shortens a win, {found} with each shorter win's
-// proof; loading reports {loading} steps.
+// proof; loading reports {loading} steps. The tables come with a search's
+// network, or else once a request needs them: a position's legal moves need
+// none, only proofs and searches do.
 //
 // The module's memory is shared with a search's other threads, each in a
 // worker that this one starts from this script before the search spawns it
@@ -103,6 +105,29 @@ async function fetched(url) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
   return new Uint8Array(await response.arrayBuffer());
+}
+
+/**
+ * The module at `url`, compiled as it downloads, so that browsers may keep
+ * the compiled code for the next visit, with its bytes, which say how much
+ * memory it takes; compiled from the bytes where the server does not send it
+ * as WebAssembly, or the browser cannot compile a download.
+ */
+async function compiled(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  const bytes = response
+    .clone()
+    .arrayBuffer()
+    .then((buffer) => new Uint8Array(buffer));
+  let module;
+  try {
+    module = await WebAssembly.compileStreaming(response);
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    module = await WebAssembly.compile(await bytes);
+  }
+  return { module, bytes: await bytes };
 }
 
 /**
@@ -288,7 +313,11 @@ function imports(module, handlers) {
  * WASI's thread-spawn: hands the thread to a ready worker, or fails as
  * EAGAIN, at once for a search stopped, whose threads' workers close. A
  * worker frees its slot a moment after the search has joined its thread, so
- * a search that spawns again at once waits for that, a second at most.
+ * a search that spawns again at once waits for that, a second at most. It
+ * joins them first, as it must: the C library keeps its list of threads
+ * locked while it spawns, and a thread takes that lock to exit, so a spawn
+ * waiting for a thread that has not yet exited would wait the whole second,
+ * and fail.
  */
 function spawn(arg) {
   if (stopping()) return -6;
@@ -425,17 +454,41 @@ function said(error) {
   return why === "" ? message : `${message}: ${why}`;
 }
 
+// Where the build's tables are, from `load`, and the pieces they cover once
+// opened, which the first request to need them waits for.
+let tablesAt = null;
+let tablesOpened = null;
+
 /**
- * Loads the module and, from the build's manifest, the tables, and for a
- * search the network and the model too. Files are named after their
- * contents, so that browsers never mix two builds.
+ * Opens the build's tables, fetched all at once, the first time a request
+ * needs them; another try follows a failed one. Replies with the most pieces
+ * they cover.
+ */
+function tables() {
+  tablesOpened ??= (async () => {
+    const { base, folder, names } = tablesAt;
+    const files = await Promise.all(names.map((name) => fetched(`${base}${folder}/${name}`)));
+    names.forEach((name, i) => ok(json(provari.add_table(...put(encoder.encode(name)), ...put(files[i])))));
+    return ok(json(provari.open_tables())).pieces;
+  })().catch((error) => {
+    tablesOpened = null;
+    throw error;
+  });
+  return tablesOpened;
+}
+
+/**
+ * Loads the module and, for a search, the network, the model and the tables
+ * from the build's manifest, the tables while the network downloads; other
+ * requests wait for the tables only where they need them. Files are named
+ * after their contents, so that browsers never mix two builds, and the
+ * tables after theirs, in a folder of their own (`tables_folder`).
  */
 async function load({ base, manifest, search, stop }) {
   const started = performance.now();
   postMessage({ loading: "provari" });
   const build = chosen(manifest);
-  const bytes = await fetched(base + build);
-  const module = await WebAssembly.compile(bytes);
+  const { module, bytes } = await compiled(base + build);
   memory = sharedMemory(leastPages(bytes));
   const instance = await WebAssembly.instantiate(
     module,
@@ -457,18 +510,17 @@ async function load({ base, manifest, search, stop }) {
   provari._initialize();
   const channel = `provari-${crypto.randomUUID()}`;
   pool = { module, slots: newSlots(), channel, workers: [], ready: 0, waiting: [], failed: null };
-  if (search) {
-    postMessage({ loading: "network" });
-    const network = await fetchedWithProgress(base + manifest.network, "network", manifest.network_bytes ?? 0);
-    ok(json(provari.load_network(...put(network))));
-    ok(json(provari.load_model(...put(await fetched(base + manifest.model)))));
-  }
+  tablesAt = { base, folder: manifest.tables_folder || "tables", names: manifest.tables };
+  if (!search) return { result: { build, channel, ms: Math.round(performance.now() - started) } };
+  postMessage({ loading: "network" });
+  const opened = tables();
+  // A failure waits for the network, which says it first.
+  opened.catch(() => {});
+  const network = await fetchedWithProgress(base + manifest.network, "network", manifest.network_bytes ?? 0);
+  ok(json(provari.load_network(...put(network))));
+  ok(json(provari.load_model(...put(await fetched(base + manifest.model)))));
   postMessage({ loading: "tablebases" });
-  for (const name of manifest.tables) {
-    const bytes = await fetched(`${base}tables/${name}`);
-    ok(json(provari.add_table(...put(encoder.encode(name)), ...put(bytes))));
-  }
-  const { pieces } = ok(json(provari.open_tables()));
+  const pieces = await opened;
   return { result: { pieces, build, channel, ms: Math.round(performance.now() - started) } };
 }
 
@@ -479,6 +531,7 @@ const handlers = {
     // search spawns it, and closed once it ends; provari refuses threads that
     // are no count.
     const threads = request.threads;
+    await tables();
     try {
       await grow(Number.isInteger(threads) && threads > 1 ? threads - 1 : 0);
       const result = json(provari.prove(...put(text(request))));
@@ -491,8 +544,12 @@ const handlers = {
       closeThreads();
     }
   },
+  // A position needs the tables only where a proof is open, which has them.
   position: ({ fen }) => ({ result: ok(json(provari.show_position(...put(text({ fen }))))) }),
-  open: ({ proof }) => ({ result: ok(json(provari.open_proof(...put(new Uint8Array(proof))))) }),
+  async open({ proof }) {
+    await tables();
+    return { result: ok(json(provari.open_proof(...put(new Uint8Array(proof))))) };
+  },
   close() {
     provari.close_proof();
     return { result: {} };
@@ -502,7 +559,10 @@ const handlers = {
     const pgn = take(provari.take_pgn());
     return { result: { pgn }, transfer: [pgn.buffer] };
   },
-  check: ({ proof }) => ({ result: json(provari.check(...put(new Uint8Array(proof)))) }),
+  async check({ proof }) {
+    await tables();
+    return { result: json(provari.check(...put(new Uint8Array(proof)))) };
+  },
   // The last request, answered once the requests before it are.
   end() {
     closeThreads();
