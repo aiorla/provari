@@ -36,6 +36,9 @@ pub const LAYER: usize = 1024;
 pub struct Model {
     attacker: Weights,
     defender: Weights,
+    /// Whether the network grades the plain moves with this model: the
+    /// file's `grade`, true unless it says false.
+    grade: bool,
 }
 
 struct Weights {
@@ -52,7 +55,8 @@ impl Model {
     /// Reads a model file: `{"features": [...], "attacker": {"bias": b,
     /// "weights": [...], "layer": [...]}, "defender": {...}}`, with the
     /// features named and ordered as `NAMES`; `layer`, the weights on the
-    /// network's first layer, is optional.
+    /// network's first layer, is optional, and `"grade": false` leaves the
+    /// plain moves ungraded by the network, as the model was fitted.
     pub fn load(path: &Path) -> Result<Model, String> {
         let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Model::from_text(&text)
@@ -106,7 +110,13 @@ impl Model {
         Ok(Model {
             attacker: weights("attacker")?,
             defender: weights("defender")?,
+            grade: model["grade"].as_bool().unwrap_or(true),
         })
+    }
+
+    /// Whether the network grades the plain moves with this model.
+    pub fn grades(&self) -> bool {
+        self.grade
     }
 
     /// The share proven among the positions the model was fitted to.

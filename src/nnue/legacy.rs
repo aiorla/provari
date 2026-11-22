@@ -18,13 +18,12 @@ use shakmaty::{Color, Role, Square};
 
 use crate::board::Position;
 
-const VERSION: u32 = 0x7AF3_2F20;
+pub(super) const VERSION: u32 = 0x7AF3_2F20;
 const HALF: usize = 512;
 const INPUTS: usize = 64 * 11 * 64;
 const BUCKETS: usize = 8;
-/// The most input rows an update applies in one pass: a capture that blows
-/// up every piece beside it changes ten squares.
-const MANY: usize = 24;
+/// The most squares a move changes: a capture's two and the eight beside it.
+const MOVED: usize = 10;
 const FC0: usize = 16;
 const FC1: usize = 32;
 /// The first layer in chunks of four outputs, the unit the dense layers skip
@@ -34,6 +33,48 @@ const CHUNKS: usize = 2 * HALF / 4;
 const TRANSFORMER_HASH: u32 = 0x5F23_48B8;
 const OUTPUT_SCALE: i64 = 16;
 const WEIGHT_SCALE_BITS: u32 = 6;
+
+/// `change_rows` with a processor's vectors: `$registers` registers of
+/// `$lanes` values at a time, every row applied to them before they are
+/// stored, so that the values are read and written once however many rows
+/// change. Every row must lie inside `$weights`.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_feature = "simd128"
+))]
+macro_rules! change_rows_in_tiles {
+    (
+        $lanes:expr, $registers:expr, $load:ident, $store:ident, $add:ident, $sub:ident,
+        $weights:expr, $from:expr, $to:expr, $removed:expr, $added:expr
+    ) => {{
+        const LANES: usize = $lanes;
+        const REGISTERS: usize = $registers;
+        const { assert!(HALF.is_multiple_of(LANES * REGISTERS)) };
+        let (weights, from, to) = ($weights.as_ptr(), $from.as_ptr(), $to.as_mut_ptr());
+        for tile in (0..HALF).step_by(LANES * REGISTERS) {
+            let mut sums = [$load(from.add(tile).cast()); REGISTERS];
+            for (register, sum) in sums.iter_mut().enumerate().skip(1) {
+                *sum = $load(from.add(tile + register * LANES).cast());
+            }
+            for &row in $removed {
+                let row = weights.add(row as usize * HALF + tile);
+                for (register, sum) in sums.iter_mut().enumerate() {
+                    *sum = $sub(*sum, $load(row.add(register * LANES).cast()));
+                }
+            }
+            for &row in $added {
+                let row = weights.add(row as usize * HALF + tile);
+                for (register, sum) in sums.iter_mut().enumerate() {
+                    *sum = $add(*sum, $load(row.add(register * LANES).cast()));
+                }
+            }
+            for (register, sum) in sums.iter().enumerate() {
+                $store(to.add(tile + register * LANES).cast(), *sum);
+            }
+        }
+    }};
+}
 
 pub struct Network {
     biases: Box<[i16; HALF]>,
@@ -68,11 +109,29 @@ const fn stack_hash() -> u32 {
     affine(hash, 1)
 }
 
-struct Reader<'a> {
+pub(super) struct Reader<'a> {
     bytes: &'a [u8],
 }
 
-impl Reader<'_> {
+impl<'a> Reader<'a> {
+    pub(super) fn new(bytes: &'a [u8]) -> Reader<'a> {
+        Reader { bytes }
+    }
+
+    /// Passes over `count` bytes.
+    pub(super) fn skip(&mut self, count: usize) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .get(count..)
+            .ok_or("the network file ends early")?;
+        Ok(())
+    }
+
+    /// Whether every byte was read.
+    pub(super) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     fn take<const N: usize>(&mut self) -> Result<[u8; N], String> {
         let (head, rest) = self
             .bytes
@@ -82,20 +141,20 @@ impl Reader<'_> {
         Ok(*head)
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(super) fn u32(&mut self) -> Result<u32, String> {
         self.take().map(u32::from_le_bytes)
     }
 
-    fn i32(&mut self) -> Result<i32, String> {
+    pub(super) fn i32(&mut self) -> Result<i32, String> {
         self.take().map(i32::from_le_bytes)
     }
 
-    fn i8(&mut self) -> Result<i8, String> {
+    pub(super) fn i8(&mut self) -> Result<i8, String> {
         self.take().map(i8::from_le_bytes)
     }
 
     /// `count` values of `N` bytes each, read at once.
-    fn many<const N: usize, T>(
+    pub(super) fn many<const N: usize, T>(
         &mut self,
         count: usize,
         read: fn([u8; N]) -> T,
@@ -118,17 +177,14 @@ impl Network {
 
     /// A network from its file's bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Network, String> {
-        let mut file = Reader { bytes };
+        let mut file = Reader::new(bytes);
         let version = file.u32()?;
         let hash = file.u32()?;
         let description = file.u32()? as usize;
         if version != VERSION || hash != TRANSFORMER_HASH ^ stack_hash() {
             return Err("not a legacy Atomic V1 network".into());
         }
-        file.bytes = file
-            .bytes
-            .get(description..)
-            .ok_or("the network file ends early")?;
+        file.skip(description)?;
         if file.u32()? != TRANSFORMER_HASH {
             return Err("an unexpected feature transformer".into());
         }
@@ -174,7 +230,7 @@ impl Network {
                 w2,
             });
         }
-        if !file.bytes.is_empty() {
+        if !file.is_empty() {
             return Err("the network file has trailing bytes".into());
         }
         Ok(Network {
@@ -224,76 +280,25 @@ impl Network {
         let before = &parent.squares;
         let after = pos.squares();
         accumulator.squares = *after;
-        // The squares that changed, eight at a time.
-        let mut changed = [0usize; 64];
-        let mut count = 0;
-        let (before_chunks, _) = before.as_chunks::<8>();
-        let (after_chunks, _) = after.as_chunks::<8>();
-        for (chunk, (old, new)) in before_chunks.iter().zip(after_chunks).enumerate() {
-            if old != new {
-                for offset in 0..8 {
-                    if old[offset] != new[offset] {
-                        changed[count] = chunk * 8 + offset;
-                        count += 1;
-                    }
-                }
-            }
-        }
+        let changed = changed_squares(before, after);
+        // A position that is not a move from its parent also starts from the
+        // cache.
+        let moved = changed.count_ones() as usize <= MOVED;
         for perspective in Color::ALL {
             let side = perspective as usize;
             let king = pos.king(perspective);
             accumulator.kings[side] = king;
-            if king.is_none() || king != parent.kings[side] {
+            let Some(king) = king.filter(|_| moved && king == parent.kings[side]) else {
                 self.refresh_cached(perspective, accumulator, cache);
                 continue;
-            }
-            let king = king.map_or(0, |king| orient(perspective, king));
-            // Two rows, as a quiet move or a capture that blows up nothing
-            // else changes, in one pass from the parent's values.
-            let rows = changed[..count]
-                .iter()
-                .map(|&square| usize::from(before[square] != 0) + usize::from(after[square] != 0))
-                .sum::<usize>();
-            if (2..=MANY).contains(&rows) {
-                let mut listed = [(0, false); MANY];
-                let mut count_listed = 0;
-                for &square in &changed[..count] {
-                    let (old, new) = (before[square], after[square]);
-                    let square = Square::new(square as u32);
-                    for (code, add) in [(old, false), (new, true)] {
-                        if code != 0 {
-                            listed[count_listed] = (feature(perspective, square, code, king), add);
-                            count_listed += 1;
-                        }
-                    }
-                }
-                if rows == 2 {
-                    self.apply_two_from(parent, accumulator, side, [listed[0], listed[1]]);
-                } else {
-                    self.apply_rows_from(parent, accumulator, side, &listed[..rows]);
-                }
-                continue;
-            }
-            // The first change starts from the parent's values, which spares
-            // copying them.
-            let mut from = Some(parent);
-            for &square in &changed[..count] {
-                let (old, new) = (before[square], after[square]);
-                let square = Square::new(square as u32);
-                for (code, add) in [(old, false), (new, true)] {
-                    if code != 0 {
-                        let index = feature(perspective, square, code, king);
-                        match from.take() {
-                            Some(parent) => self.apply_from(parent, accumulator, side, index, add),
-                            None => self.apply(accumulator, side, index, add),
-                        }
-                    }
-                }
-            }
-            if from.is_some() {
-                accumulator.values[side] = parent.values[side];
-                accumulator.psqt[side] = parent.psqt[side];
-            }
+            };
+            let king = orient(perspective, king);
+            let rows = Rows::<MOVED>::of(perspective, king, changed, before, after);
+            self.change(
+                (&parent.values[side], &parent.psqt[side]),
+                (&mut accumulator.values[side], &mut accumulator.psqt[side]),
+                &rows,
+            );
         }
     }
 
@@ -316,8 +321,8 @@ impl Network {
         for perspective in Color::ALL {
             let side = perspective as usize;
             let king = parent.kings[side].map_or(0, |king| orient(perspective, king));
-            let old = feature(perspective, from, code, king);
-            let new = feature(perspective, to, code, king);
+            let old = feature(perspective, from as usize, code, king);
+            let new = feature(perspective, to as usize, code, king);
             let taken = &self.weights[old * HALF..(old + 1) * HALF];
             let added = &self.weights[new * HALF..(new + 1) * HALF];
             for (((value, start), taken), added) in accumulator.values[side]
@@ -356,256 +361,62 @@ impl Network {
         };
         let king = orient(perspective, king);
         let entry = &mut cache.entries[side * 64 + king];
-        let (old_chunks, _) = entry.squares.as_chunks::<8>();
-        let (new_chunks, _) = accumulator.squares.as_chunks::<8>();
-        for (chunk, (old, new)) in old_chunks.iter().zip(new_chunks).enumerate() {
-            if old == new {
-                continue;
-            }
-            for offset in 0..8 {
-                let (old, new) = (old[offset], new[offset]);
-                if old == new {
-                    continue;
-                }
-                let square = Square::new((chunk * 8 + offset) as u32);
-                for (code, add) in [(old, false), (new, true)] {
-                    if code != 0 {
-                        let index = feature(perspective, square, code, king);
-                        self.apply_to(&mut entry.values, &mut entry.psqt, index, add);
-                    }
-                }
-            }
-        }
+        let (before, after) = (&entry.squares, &accumulator.squares);
+        let changed = changed_squares(before, after);
+        let rows = Rows::<64>::of(perspective, king, changed, before, after);
+        self.change(
+            (&entry.values, &entry.psqt),
+            (&mut accumulator.values[side], &mut accumulator.psqt[side]),
+            &rows,
+        );
         entry.squares = accumulator.squares;
-        accumulator.values[side] = entry.values;
-        accumulator.psqt[side] = entry.psqt;
+        entry.values = accumulator.values[side];
+        entry.psqt = accumulator.psqt[side];
     }
 
+    /// A side's first layer from scratch: the biases with every piece's row
+    /// added.
     fn refresh_side(&self, perspective: Color, accumulator: &mut Accumulator) {
         let side = perspective as usize;
-        let squares = accumulator.squares;
         let king = accumulator.kings[side].map_or(0, |king| orient(perspective, king));
-        accumulator.values[side] = *self.biases;
-        accumulator.psqt[side] = [0; BUCKETS];
-        for (square, &code) in squares.iter().enumerate() {
-            if code != 0 {
-                let index = feature(perspective, Square::new(square as u32), code, king);
-                self.apply(accumulator, side, index, true);
-            }
-        }
-    }
-
-    /// The side's values and material: the parent's with an input's row added
-    /// or taken away.
-    fn apply_from(
-        &self,
-        parent: &Accumulator,
-        accumulator: &mut Accumulator,
-        side: usize,
-        index: usize,
-        add: bool,
-    ) {
-        let row = &self.weights[index * HALF..(index + 1) * HALF];
-        let psqt = &self.psqt[index * BUCKETS..(index + 1) * BUCKETS];
-        let values = accumulator.values[side]
-            .iter_mut()
-            .zip(&parent.values[side])
-            .zip(row);
-        let materials = accumulator.psqt[side]
-            .iter_mut()
-            .zip(&parent.psqt[side])
-            .zip(psqt);
-        if add {
-            for ((value, start), weight) in values {
-                *value = start.wrapping_add(*weight);
-            }
-            for ((value, start), weight) in materials {
-                *value = start + weight;
-            }
-        } else {
-            for ((value, start), weight) in values {
-                *value = start.wrapping_sub(*weight);
-            }
-            for ((value, start), weight) in materials {
-                *value = start - weight;
-            }
-        }
-    }
-
-    /// The side's values and material: the parent's with two inputs' rows
-    /// added or taken away, in one pass. Sums wrap, so the values are those of
-    /// applying the rows one after the other.
-    fn apply_two_from(
-        &self,
-        parent: &Accumulator,
-        accumulator: &mut Accumulator,
-        side: usize,
-        [(first, add_first), (second, add_second)]: [(usize, bool); 2],
-    ) {
-        let a = &self.weights[first * HALF..(first + 1) * HALF];
-        let b = &self.weights[second * HALF..(second + 1) * HALF];
-        let values = accumulator.values[side]
-            .iter_mut()
-            .zip(&parent.values[side])
-            .zip(a)
-            .zip(b);
-        match (add_first, add_second) {
-            (false, true) => {
-                for (((value, start), a), b) in values {
-                    *value = start.wrapping_sub(*a).wrapping_add(*b);
-                }
-            }
-            (true, false) => {
-                for (((value, start), a), b) in values {
-                    *value = start.wrapping_add(*a).wrapping_sub(*b);
-                }
-            }
-            (false, false) => {
-                for (((value, start), a), b) in values {
-                    *value = start.wrapping_sub(*a).wrapping_sub(*b);
-                }
-            }
-            (true, true) => {
-                for (((value, start), a), b) in values {
-                    *value = start.wrapping_add(*a).wrapping_add(*b);
-                }
-            }
-        }
-        let a = &self.psqt[first * BUCKETS..(first + 1) * BUCKETS];
-        let b = &self.psqt[second * BUCKETS..(second + 1) * BUCKETS];
-        for (((value, start), a), b) in accumulator.psqt[side]
-            .iter_mut()
-            .zip(&parent.psqt[side])
-            .zip(a)
-            .zip(b)
-        {
-            let once = if add_first { start + a } else { start - a };
-            *value = if add_second { once + b } else { once - b };
-        }
-    }
-
-    /// The side's values and material: the parent's with several inputs' rows
-    /// added or taken away (a capture that blows up pieces beside it, or
-    /// castling), a tile of values at a time kept in registers. Sums wrap, so
-    /// the values are those of applying the rows one after the other.
-    fn apply_rows_from(
-        &self,
-        parent: &Accumulator,
-        accumulator: &mut Accumulator,
-        side: usize,
-        rows: &[(usize, bool)],
-    ) {
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: every row's index is a feature's, below INPUTS, so each row
-        // holds HALF values, as both sides' values do.
-        unsafe {
-            self.apply_rows_neon(&parent.values[side], &mut accumulator.values[side], rows);
-        }
-        #[cfg(target_feature = "simd128")]
-        simd128::apply_rows(
-            &self.weights,
-            &parent.values[side],
-            &mut accumulator.values[side],
-            rows,
+        let (before, after) = (&[0; 64], &accumulator.squares);
+        let changed = changed_squares(before, after);
+        let rows = Rows::<64>::of(perspective, king, changed, before, after);
+        self.change(
+            (&self.biases, &[0; BUCKETS]),
+            (&mut accumulator.values[side], &mut accumulator.psqt[side]),
+            &rows,
         );
-        #[cfg(not(any(target_arch = "aarch64", target_feature = "simd128")))]
-        apply_rows(
-            &self.weights,
-            &parent.values[side],
-            &mut accumulator.values[side],
-            rows,
-        );
-        let mut materials = parent.psqt[side];
-        for &(index, add) in rows {
-            let weights = &self.psqt[index * BUCKETS..(index + 1) * BUCKETS];
+    }
+
+    /// A side's values and material, `to`: those of `from` with rows taken
+    /// away and rows added.
+    fn change<const N: usize>(
+        &self,
+        from: (&[i16; HALF], &[i32; BUCKETS]),
+        to: (&mut [i16; HALF], &mut [i32; BUCKETS]),
+        rows: &Rows<N>,
+    ) {
+        let (removed, added) = (rows.removed(), rows.added());
+        // SAFETY: the rows are features', below INPUTS, and the weights hold
+        // INPUTS rows.
+        unsafe { change_rows(&self.weights, from.0, to.0, removed, added) };
+        let mut materials = *from.1;
+        for &row in removed {
+            let row = row as usize;
+            let weights = &self.psqt[row * BUCKETS..(row + 1) * BUCKETS];
             for (value, weight) in materials.iter_mut().zip(weights) {
-                if add {
-                    *value += weight;
-                } else {
-                    *value -= weight;
-                }
-            }
-        }
-        accumulator.psqt[side] = materials;
-    }
-
-    /// `apply_rows_from`'s values with NEON: 64 at a time in eight registers,
-    /// every row applied to them before they are stored.
-    ///
-    /// # Safety
-    ///
-    /// Every row's index must be below INPUTS.
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn apply_rows_neon(
-        &self,
-        parent: &[i16; HALF],
-        values: &mut [i16; HALF],
-        rows: &[(usize, bool)],
-    ) {
-        use std::arch::aarch64::{
-            int16x8_t, vaddq_s16, vdupq_n_s16, vld1q_s16, vst1q_s16, vsubq_s16,
-        };
-        const LANES: usize = 8;
-        const REGISTERS: usize = 8;
-        debug_assert!(rows.iter().all(|&(index, _)| index < INPUTS));
-        for tile in (0..HALF).step_by(LANES * REGISTERS) {
-            // SAFETY: the tile's 64 values lie inside `parent`, `values` and
-            // each row, which holds HALF values from `index * HALF`.
-            unsafe {
-                let mut sums: [int16x8_t; REGISTERS] = [vdupq_n_s16(0); REGISTERS];
-                for (register, sum) in sums.iter_mut().enumerate() {
-                    *sum = vld1q_s16(parent.as_ptr().add(tile + register * LANES));
-                }
-                for &(index, add) in rows {
-                    let row = self.weights.as_ptr().add(index * HALF + tile);
-                    if add {
-                        for (register, sum) in sums.iter_mut().enumerate() {
-                            *sum = vaddq_s16(*sum, vld1q_s16(row.add(register * LANES)));
-                        }
-                    } else {
-                        for (register, sum) in sums.iter_mut().enumerate() {
-                            *sum = vsubq_s16(*sum, vld1q_s16(row.add(register * LANES)));
-                        }
-                    }
-                }
-                for (register, sum) in sums.iter().enumerate() {
-                    vst1q_s16(values.as_mut_ptr().add(tile + register * LANES), *sum);
-                }
-            }
-        }
-    }
-
-    /// The side's values and material with an input's row added or taken
-    /// away.
-    fn apply(&self, accumulator: &mut Accumulator, side: usize, index: usize, add: bool) {
-        let (values, psqt) = (&mut accumulator.values[side], &mut accumulator.psqt[side]);
-        self.apply_to(values, psqt, index, add);
-    }
-
-    fn apply_to(
-        &self,
-        values: &mut [i16; HALF],
-        materials: &mut [i32; BUCKETS],
-        index: usize,
-        add: bool,
-    ) {
-        let row = &self.weights[index * HALF..(index + 1) * HALF];
-        let psqt = &self.psqt[index * BUCKETS..(index + 1) * BUCKETS];
-        if add {
-            for (value, weight) in values.iter_mut().zip(row) {
-                *value = value.wrapping_add(*weight);
-            }
-            for (value, weight) in materials.iter_mut().zip(psqt) {
-                *value += weight;
-            }
-        } else {
-            for (value, weight) in values.iter_mut().zip(row) {
-                *value = value.wrapping_sub(*weight);
-            }
-            for (value, weight) in materials.iter_mut().zip(psqt) {
                 *value -= weight;
             }
         }
+        for &row in added {
+            let row = row as usize;
+            let weights = &self.psqt[row * BUCKETS..(row + 1) * BUCKETS];
+            for (value, weight) in materials.iter_mut().zip(weights) {
+                *value += weight;
+            }
+        }
+        *to.1 = materials;
     }
 
     /// The evaluation for the side to move from a position's first layer.
@@ -666,51 +477,144 @@ impl Network {
     }
 }
 
-/// `Network::apply_rows_from`'s values without NEON or WebAssembly's SIMD:
-/// with AVX2 where the processor has it.
-#[cfg_attr(
-    any(target_arch = "aarch64", target_feature = "simd128"),
-    allow(dead_code)
-)]
-fn apply_rows(
-    weights: &[i16],
-    parent: &[i16; HALF],
-    values: &mut [i16; HALF],
-    rows: &[(usize, bool)],
-) {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        assert!(
-            rows.iter()
-                .all(|&(index, _)| (index + 1) * HALF <= weights.len())
-        );
-        // SAFETY: the processor has AVX2, and every row lies inside `weights`.
-        unsafe { avx2::apply_rows(weights, parent, values, rows) };
-        return;
-    }
-    apply_rows_portable(weights, parent, values, rows);
+/// The input rows that a change of pieces takes away from a perspective's
+/// first layer and those it adds, at most N of each.
+struct Rows<const N: usize> {
+    removed: [u32; N],
+    added: [u32; N],
+    taken: usize,
+    put: usize,
 }
 
-/// `apply_rows` one row after the other.
+impl<const N: usize> Rows<N> {
+    /// The rows of the squares in `changed`, at most N, whose pieces go from
+    /// `before`'s to `after`'s, for a perspective whose king is on `king`,
+    /// oriented. Each square's rows are written to both lists and counted
+    /// only where it holds a piece, so that no branch depends on the pieces.
+    fn of(
+        perspective: Color,
+        king: usize,
+        mut changed: u64,
+        before: &[u8; 64],
+        after: &[u8; 64],
+    ) -> Rows<N> {
+        let mut rows = Rows {
+            removed: [0; N],
+            added: [0; N],
+            taken: 0,
+            put: 0,
+        };
+        while changed != 0 {
+            let square = changed.trailing_zeros() as usize;
+            changed &= changed - 1;
+            let (old, new) = (before[square], after[square]);
+            rows.removed[rows.taken] = feature(perspective, square, old, king) as u32;
+            rows.taken += usize::from(old != 0);
+            rows.added[rows.put] = feature(perspective, square, new, king) as u32;
+            rows.put += usize::from(new != 0);
+        }
+        rows
+    }
+
+    fn removed(&self) -> &[u32] {
+        &self.removed[..self.taken]
+    }
+
+    fn added(&self) -> &[u32] {
+        &self.added[..self.put]
+    }
+}
+
+/// The squares whose codes differ between two boards, a bit each. A code is
+/// below 16, so a byte of two codes' difference plus 127 has its high bit set
+/// if they differ and carries nothing into the next byte: no branch depends
+/// on which squares changed.
+pub(super) fn changed_squares(before: &[u8; 64], after: &[u8; 64]) -> u64 {
+    let (before, _) = before.as_chunks::<8>();
+    let (after, _) = after.as_chunks::<8>();
+    let mut changed = 0;
+    for (rank, (old, new)) in before.iter().zip(after).enumerate() {
+        let differ = u64::from_le_bytes(*old) ^ u64::from_le_bytes(*new);
+        let high = differ.wrapping_add(0x7f7f_7f7f_7f7f_7f7f) & 0x8080_8080_8080_8080;
+        // The eight high bits, gathered into the top byte.
+        let bits = (high >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56;
+        changed |= bits << (8 * rank);
+    }
+    changed
+}
+
+/// A side's values, `to`: those of `from` less the rows `removed` plus the
+/// rows `added`. Sums wrap, so the values are those of applying the rows one
+/// after the other, in any order.
+///
+/// # Safety
+///
+/// Every row must lie inside `weights`, as HALF values from the row times
+/// HALF.
+unsafe fn change_rows(
+    weights: &[i16],
+    from: &[i16; HALF],
+    to: &mut [i16; HALF],
+    removed: &[u32],
+    added: &[u32],
+) {
+    debug_assert!(
+        removed
+            .iter()
+            .chain(added)
+            .all(|&row| (row as usize + 1) * HALF <= weights.len())
+    );
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: every aarch64 processor has NEON, and the caller keeps every
+    // row inside `weights`.
+    unsafe {
+        use std::arch::aarch64::{vaddq_s16, vld1q_s16, vst1q_s16, vsubq_s16};
+        change_rows_in_tiles!(
+            8, 16, vld1q_s16, vst1q_s16, vaddq_s16, vsubq_s16, weights, from, to, removed, added
+        );
+    }
+    #[cfg(target_feature = "simd128")]
+    // SAFETY: the caller keeps every row inside `weights`.
+    unsafe {
+        use std::arch::wasm32::{i16x8_add, i16x8_sub, v128_load, v128_store};
+        change_rows_in_tiles!(
+            8, 8, v128_load, v128_store, i16x8_add, i16x8_sub, weights, from, to, removed, added
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2, and the caller keeps every row
+        // inside `weights`.
+        unsafe { avx2::change_rows(weights, from, to, removed, added) };
+        return;
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_feature = "simd128")))]
+    change_rows_portable(weights, from, to, removed, added);
+}
+
+/// `change_rows` one row after the other.
 #[cfg_attr(
     any(target_arch = "aarch64", target_feature = "simd128"),
     allow(dead_code)
 )]
-fn apply_rows_portable(
+fn change_rows_portable(
     weights: &[i16],
-    parent: &[i16; HALF],
-    values: &mut [i16; HALF],
-    rows: &[(usize, bool)],
+    from: &[i16; HALF],
+    to: &mut [i16; HALF],
+    removed: &[u32],
+    added: &[u32],
 ) {
-    *values = *parent;
-    for &(index, add) in rows {
-        let row = &weights[index * HALF..(index + 1) * HALF];
-        for (value, weight) in values.iter_mut().zip(row) {
-            *value = if add {
-                value.wrapping_add(*weight)
-            } else {
-                value.wrapping_sub(*weight)
-            };
+    *to = *from;
+    for &row in removed {
+        let row = &weights[row as usize * HALF..(row as usize + 1) * HALF];
+        for (value, weight) in to.iter_mut().zip(row) {
+            *value = value.wrapping_sub(*weight);
+        }
+    }
+    for &row in added {
+        let row = &weights[row as usize * HALF..(row as usize + 1) * HALF];
+        for (value, weight) in to.iter_mut().zip(row) {
+            *value = value.wrapping_add(*weight);
         }
     }
 }
@@ -824,12 +728,73 @@ impl Transformed {
                 *output = value.clamp(0, 127) as u8;
             }
         }
+        self.list_portable();
+    }
+
+    /// Lists the nonzero chunks of `values`, for a network that writes them
+    /// itself: as `fill` lists them, eight chunks at a time.
+    pub(super) fn list(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        self.list_neon();
+        #[cfg(target_feature = "simd128")]
+        simd128::list(self);
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the processor has AVX2.
+            unsafe { avx2::list(self) };
+            return;
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_feature = "simd128")))]
+        self.list_portable();
+    }
+
+    #[cfg_attr(
+        any(target_arch = "aarch64", target_feature = "simd128"),
+        allow(dead_code)
+    )]
+    fn list_portable(&mut self) {
         self.counts = [0; 2];
         for (index, chunk) in self.values.as_chunks::<4>().0.iter().enumerate() {
             let parity = index % 2;
             self.chunks[parity][self.counts[parity]] = index as u16;
             self.counts[parity] += usize::from(u32::from_ne_bytes(*chunk) != 0);
         }
+    }
+
+    /// `list` with NEON, 32 outputs at a time: their eight chunks' nonzero
+    /// bits looked up as indices.
+    #[cfg(target_arch = "aarch64")]
+    fn list_neon(&mut self) {
+        use std::arch::aarch64::{
+            vadd_u16, vaddvq_u32, vandq_u32, vdup_n_u16, vld1_u16, vld1q_u8, vld1q_u32, vorrq_u32,
+            vreinterpretq_u32_u8, vst1_u16, vtstq_u32,
+        };
+        let mut counts = [0; 2];
+        // SAFETY: every aarch64 processor has NEON. The loads read 32 bytes
+        // inside `values`, and the stores write four indices inside each
+        // list of `chunks`: before a group's indices are written, at most
+        // four per earlier group are, so at most CHUNKS / 2 - 4.
+        unsafe {
+            let low = vld1q_u32([1, 2, 4, 8].as_ptr());
+            let high = vld1q_u32([16, 32, 64, 128].as_ptr());
+            for group in 0..2 * HALF / 32 {
+                let values = self.values.as_ptr().add(group * 32);
+                let first = vreinterpretq_u32_u8(vld1q_u8(values));
+                let second = vreinterpretq_u32_u8(vld1q_u8(values.add(16)));
+                let bits = vorrq_u32(
+                    vandq_u32(vtstq_u32(first, first), low),
+                    vandq_u32(vtstq_u32(second, second), high),
+                );
+                let byte = vaddvq_u32(bits) as usize;
+                let base = vdup_n_u16((group * 8) as u16);
+                for (parity, count) in counts.iter_mut().enumerate() {
+                    let indices = vadd_u16(vld1_u16(SET_BITS[byte][parity].as_ptr()), base);
+                    vst1_u16(self.chunks[parity].as_mut_ptr().add(*count), indices);
+                    *count += usize::from(SET_COUNTS[byte][parity]);
+                }
+            }
+        }
+        self.counts = counts;
     }
 
     /// `fill` with NEON, 32 outputs at a time: clipped by saturating to a
@@ -1100,17 +1065,41 @@ fn orient(perspective: Color, square: Square) -> usize {
     }
 }
 
-/// A piece's input, by its square code, for a perspective whose king is on
-/// `king`, oriented.
-fn feature(perspective: Color, square: Square, code: u8, king: usize) -> usize {
-    let role = usize::from(code & 7);
-    let white = code & 8 != 0;
-    let plane = if role == Role::King as usize {
-        10
-    } else {
-        2 * (role - 1) + usize::from(white != perspective.is_white())
+/// Each piece code's plane times 64 for each perspective, Black's first: the
+/// perspective's own pieces of a role, then the other side's, and both kings
+/// in the last.
+static PLANES: [[u16; 16]; 2] = {
+    let mut planes = [[0; 16]; 2];
+    let mut side = 0;
+    while side < 2 {
+        let mut code = 0;
+        while code < 16 {
+            let (role, white) = (code & 7, code & 8 != 0);
+            let plane = if role == Role::King as usize {
+                10
+            } else if role >= Role::Pawn as usize && role < Role::King as usize {
+                2 * (role - 1) + (white != (side == Color::White as usize)) as usize
+            } else {
+                0
+            };
+            planes[side][code] = (plane * 64) as u16;
+            code += 1;
+        }
+        side += 1;
+    }
+    planes
+};
+
+/// A piece's input, by its square and its code there, for a perspective
+/// whose king is on `king`, oriented. No piece, code 0, has an input too,
+/// which nothing reads.
+fn feature(perspective: Color, square: usize, code: u8, king: usize) -> usize {
+    let flip = match perspective {
+        Color::White => 0,
+        Color::Black => 56,
     };
-    orient(perspective, square) + plane * 64 + king * 11 * 64
+    let plane = PLANES[perspective as usize][usize::from(code & 15)];
+    (square ^ flip) + usize::from(plane) + king * 11 * 64
 }
 
 /// The network with AVX2, for x86-64 processors that have it, as most made
@@ -1137,53 +1126,36 @@ mod avx2 {
         CHUNKS, FC0, FC1, HALF, SET_BITS, SET_COUNTS, Stack, Transformed, WEIGHT_SCALE_BITS,
     };
 
-    /// `apply_rows`: 128 values at a time in eight registers, every row
-    /// applied to them before they are stored.
+    /// `change_rows`, 256 values at a time in sixteen registers.
     ///
     /// # Safety
     ///
     /// The processor must have AVX2, and every row lie inside `weights`, as
-    /// HALF values from `index * HALF`.
+    /// HALF values from the row times HALF.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn apply_rows(
+    pub unsafe fn change_rows(
         weights: &[i16],
-        parent: &[i16; HALF],
-        values: &mut [i16; HALF],
-        rows: &[(usize, bool)],
+        from: &[i16; HALF],
+        to: &mut [i16; HALF],
+        removed: &[u32],
+        added: &[u32],
     ) {
-        const LANES: usize = 16;
-        const REGISTERS: usize = 8;
-        debug_assert!(
-            rows.iter()
-                .all(|&(index, _)| (index + 1) * HALF <= weights.len())
-        );
-        for tile in (0..HALF).step_by(LANES * REGISTERS) {
-            // SAFETY: the tile's 128 values lie inside `parent`, `values` and
-            // each row; the loads and stores need no alignment.
-            unsafe {
-                let mut sums = [_mm256_setzero_si256(); REGISTERS];
-                for (register, sum) in sums.iter_mut().enumerate() {
-                    *sum = _mm256_loadu_si256(parent.as_ptr().add(tile + register * LANES).cast());
-                }
-                for &(index, add) in rows {
-                    let row = weights.as_ptr().add(index * HALF + tile);
-                    if add {
-                        for (register, sum) in sums.iter_mut().enumerate() {
-                            let weight = _mm256_loadu_si256(row.add(register * LANES).cast());
-                            *sum = _mm256_add_epi16(*sum, weight);
-                        }
-                    } else {
-                        for (register, sum) in sums.iter_mut().enumerate() {
-                            let weight = _mm256_loadu_si256(row.add(register * LANES).cast());
-                            *sum = _mm256_sub_epi16(*sum, weight);
-                        }
-                    }
-                }
-                for (register, sum) in sums.iter().enumerate() {
-                    let at = values.as_mut_ptr().add(tile + register * LANES);
-                    _mm256_storeu_si256(at.cast(), *sum);
-                }
-            }
+        // SAFETY: the caller keeps every row inside `weights`; the loads and
+        // stores need no alignment.
+        unsafe {
+            change_rows_in_tiles!(
+                16,
+                16,
+                _mm256_loadu_si256,
+                _mm256_storeu_si256,
+                _mm256_add_epi16,
+                _mm256_sub_epi16,
+                weights,
+                from,
+                to,
+                removed,
+                added
+            );
         }
     }
 
@@ -1227,6 +1199,37 @@ mod avx2 {
                         _mm_storel_epi64(at.cast(), _mm_add_epi16(bits, base));
                         *count += usize::from(SET_COUNTS[byte][parity]);
                     }
+                }
+            }
+        }
+        transformed.counts = counts;
+    }
+
+    /// `Transformed::list`, 32 outputs at a time: their eight chunks' nonzero
+    /// bits looked up as indices.
+    ///
+    /// # Safety
+    ///
+    /// The processor must have AVX2.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn list(transformed: &mut Transformed) {
+        let mut counts = [0; 2];
+        let zero = _mm256_setzero_si256();
+        for group in 0..2 * HALF / 32 {
+            // SAFETY: the load reads 32 bytes inside `values`, and the
+            // stores write four indices inside each list of `chunks`:
+            // before a group's indices are written, at most four per
+            // earlier group are, so at most CHUNKS / 2 - 4.
+            unsafe {
+                let values = transformed.values.as_ptr().add(group * 32);
+                let zeros = _mm256_cmpeq_epi32(_mm256_loadu_si256(values.cast()), zero);
+                let byte = !_mm256_movemask_ps(_mm256_castsi256_ps(zeros)) as usize & 0xff;
+                let base = _mm_set1_epi16((group * 8) as i16);
+                for (parity, count) in counts.iter_mut().enumerate() {
+                    let bits = _mm_loadl_epi64(SET_BITS[byte][parity].as_ptr().cast());
+                    let at = transformed.chunks[parity].as_mut_ptr().add(*count);
+                    _mm_storel_epi64(at.cast(), _mm_add_epi16(bits, base));
+                    *count += usize::from(SET_COUNTS[byte][parity]);
                 }
             }
         }
@@ -1372,55 +1375,12 @@ mod avx2 {
 #[cfg(target_feature = "simd128")]
 mod simd128 {
     use std::arch::wasm32::{
-        i16x8_add, i16x8_sub, i32x4_add, i32x4_bitmask, i32x4_extract_lane, i32x4_ne,
-        i32x4_shuffle, i32x4_splat, u8x16_min, u8x16_narrow_i16x8, u8x16_splat, u16x8_add,
-        u16x8_splat, v128, v128_load, v128_load32_splat, v128_load64_zero, v128_store,
-        v128_store64_lane,
+        i32x4_add, i32x4_bitmask, i32x4_extract_lane, i32x4_ne, i32x4_shuffle, i32x4_splat,
+        u8x16_min, u8x16_narrow_i16x8, u8x16_splat, u16x8_add, u16x8_splat, v128, v128_load,
+        v128_load32_splat, v128_load64_zero, v128_store, v128_store64_lane,
     };
 
-    use super::{CHUNKS, FC0, FC1, HALF, INPUTS, SET_BITS, SET_COUNTS, Stack, Transformed, relu};
-
-    /// `apply_rows_from`'s values: 64 at a time in eight registers, every row
-    /// applied to them before they are stored. Every row's index must be
-    /// below INPUTS, and `weights` hold INPUTS rows of HALF values.
-    pub fn apply_rows(
-        weights: &[i16],
-        parent: &[i16; HALF],
-        values: &mut [i16; HALF],
-        rows: &[(usize, bool)],
-    ) {
-        const LANES: usize = 8;
-        const REGISTERS: usize = 8;
-        assert!(rows.iter().all(|&(index, _)| index < INPUTS) && weights.len() == INPUTS * HALF);
-        for tile in (0..HALF).step_by(LANES * REGISTERS) {
-            // SAFETY: the tile's 64 values lie inside `parent`, `values` and
-            // each row, which holds HALF values from `index * HALF`; the loads
-            // and stores need no alignment.
-            unsafe {
-                let mut sums = [i32x4_splat(0); REGISTERS];
-                for (register, sum) in sums.iter_mut().enumerate() {
-                    *sum = v128_load(parent.as_ptr().add(tile + register * LANES).cast());
-                }
-                for &(index, add) in rows {
-                    let row = weights.as_ptr().add(index * HALF + tile);
-                    for (register, sum) in sums.iter_mut().enumerate() {
-                        let weight = v128_load(row.add(register * LANES).cast());
-                        *sum = if add {
-                            i16x8_add(*sum, weight)
-                        } else {
-                            i16x8_sub(*sum, weight)
-                        };
-                    }
-                }
-                for (register, sum) in sums.iter().enumerate() {
-                    v128_store(
-                        values.as_mut_ptr().add(tile + register * LANES).cast(),
-                        *sum,
-                    );
-                }
-            }
-        }
-    }
+    use super::{CHUNKS, FC0, FC1, HALF, SET_BITS, SET_COUNTS, Stack, Transformed, relu};
 
     /// `Transformed::fill`, 32 outputs at a time: clipped by narrowing to
     /// bytes with unsigned saturation and taking the minimum with 127, then
@@ -1457,6 +1417,35 @@ mod simd128 {
                         v128_store64_lane::<0>(u16x8_add(bits, base), at.cast());
                         *count += usize::from(SET_COUNTS[byte][parity]);
                     }
+                }
+            }
+        }
+        transformed.counts = counts;
+    }
+
+    /// `Transformed::list`, 32 outputs at a time: their eight chunks' nonzero
+    /// bits looked up as indices.
+    pub fn list(transformed: &mut Transformed) {
+        let mut counts = [0; 2];
+        let zero = i32x4_splat(0);
+        for group in 0..2 * HALF / 32 {
+            // SAFETY: the loads read 32 bytes inside `values`, and the
+            // stores write four indices inside each list of `chunks`:
+            // before a group's indices are written, at most four per
+            // earlier group are, so at most CHUNKS / 2 - 4.
+            unsafe {
+                let values = transformed.values.as_ptr().add(group * 32);
+                let first = v128_load(values.cast());
+                let second = v128_load(values.add(16).cast());
+                let byte = i32x4_bitmask(i32x4_ne(first, zero))
+                    | i32x4_bitmask(i32x4_ne(second, zero)) << 4;
+                let byte = usize::from(byte);
+                let base = u16x8_splat((group * 8) as u16);
+                for (parity, count) in counts.iter_mut().enumerate() {
+                    let bits = v128_load64_zero(SET_BITS[byte][parity].as_ptr().cast());
+                    let at = transformed.chunks[parity].as_mut_ptr().add(*count);
+                    v128_store64_lane::<0>(u16x8_add(bits, base), at.cast());
+                    *count += usize::from(SET_COUNTS[byte][parity]);
                 }
             }
         }
@@ -1639,10 +1628,12 @@ mod simd128 {
 pub(crate) mod tests {
     use std::path::Path;
 
+    use shakmaty::{Color, Role};
+
     use super::{
-        Accumulator, CHUNKS, FC0, FC1, HALF, MANY, Network, RefreshCache, Stack, Transformed,
-        apply_rows, apply_rows_portable, first_layer, first_layer_portable, later_layers,
-        later_layers_portable,
+        Accumulator, BUCKETS, CHUNKS, FC0, FC1, HALF, INPUTS, MOVED, Network, RefreshCache, Rows,
+        Stack, Transformed, change_rows, change_rows_portable, changed_squares, feature,
+        first_layer, first_layer_portable, later_layers, later_layers_portable,
     };
     use crate::board::{Position, from_fen};
 
@@ -1707,6 +1698,13 @@ pub(crate) mod tests {
             portable.fill_portable([&halves[0], &halves[1]]);
             assert_eq!(portable.values, transformed.values);
             assert_eq!(portable.nonzero(), transformed.nonzero());
+            // Listed again from the values alone.
+            let mut listed = Transformed {
+                values: transformed.values,
+                ..Default::default()
+            };
+            listed.list();
+            assert_eq!(listed.nonzero(), transformed.nonzero());
         }
     }
 
@@ -1763,44 +1761,143 @@ pub(crate) mod tests {
         }
     }
 
-    /// Several rows added to and taken from a side's values in one pass, with
-    /// the processor's instructions and without, over random weights whose
-    /// sums wrap.
+    /// Rows taken from a side's values and rows added to them in one pass,
+    /// with the processor's instructions and without, over random weights
+    /// whose sums wrap.
     #[test]
-    fn applies_rows_as_portable() {
+    fn changes_rows_as_portable() {
         let mut random = Random(0xda94_2042_e4dd_58b5);
         let weights: Vec<i16> = (0..64 * HALF).map(|_| random.next() as i16).collect();
         for trial in 0..500 {
-            let parent = std::array::from_fn(|_| random.next() as i16);
-            let rows: Vec<_> = (0..trial % (MANY + 1))
-                .map(|_| ((random.next() % 64) as usize, random.next() & 1 == 0))
-                .collect();
-            let (mut values, mut expected) = ([0; HALF], [0; HALF]);
-            apply_rows(&weights, &parent, &mut values, &rows);
-            apply_rows_portable(&weights, &parent, &mut expected, &rows);
-            assert_eq!(values, expected);
+            let from = std::array::from_fn(|_| random.next() as i16);
+            let mut rows =
+                |count| -> Vec<u32> { (0..count).map(|_| (random.next() % 64) as u32).collect() };
+            let (removed, added) = (rows(trial % 33), rows(trial / 33 % 33));
+            let (mut to, mut expected) = ([0; HALF], [0; HALF]);
+            // SAFETY: the rows are below 64, and the weights hold 64.
+            unsafe { change_rows(&weights, &from, &mut to, &removed, &added) };
+            change_rows_portable(&weights, &from, &mut expected, &removed, &added);
+            assert_eq!(to, expected);
         }
     }
 
-    /// The first layers a line updates match computing them from scratch,
-    /// over random games, with the network bundled builds carry; the test
-    /// passes without checking when `data/network.nnue` is absent.
+    /// The squares that differ between two boards and their rows, against
+    /// the definition: a piece by its square and the perspective's king
+    /// square, Black's board flipped, each side's pieces of a role in a
+    /// plane, the perspective's own first, and both kings in the last.
     #[test]
-    fn updates_match_refreshes() {
-        let path = Path::new("data/network.nnue");
-        if !path.exists() {
-            return;
+    fn rows_as_defined() {
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        let mut board = |pieces: u64| -> [u8; 64] {
+            std::array::from_fn(|_| match random.next() % 64 {
+                dice if dice < pieces => (1 + random.next() % 6) as u8 | (random.next() & 8) as u8,
+                _ => 0,
+            })
+        };
+        for trial in 0..2000 {
+            let before = board(trial % 40);
+            let mut after = board(trial % 40);
+            // Most squares alike, as after a move or a few.
+            for square in 0..64 {
+                if !(trial + square as u64 * 7).is_multiple_of(trial % 9 + 1) {
+                    after[square] = before[square];
+                }
+            }
+            let changed = changed_squares(&before, &after);
+            for square in 0..64 {
+                assert_eq!(changed >> square & 1 != 0, before[square] != after[square]);
+            }
+            for perspective in Color::ALL {
+                let king = (trial as usize * 5 + 3) % 64;
+                let defined = |board: &[u8; 64]| -> Vec<u32> {
+                    (0..64usize)
+                        .filter(|&square| changed >> square & 1 != 0 && board[square] != 0)
+                        .map(|square| {
+                            let code = board[square];
+                            let role = usize::from(code & 7);
+                            let white = code & 8 != 0;
+                            let plane = if role == Role::King as usize {
+                                10
+                            } else {
+                                2 * (role - 1) + usize::from(white != perspective.is_white())
+                            };
+                            let oriented = if perspective.is_white() {
+                                square
+                            } else {
+                                square ^ 56
+                            };
+                            assert_eq!(
+                                feature(perspective, square, code, king),
+                                oriented + plane * 64 + king * 11 * 64
+                            );
+                            (oriented + plane * 64 + king * 11 * 64) as u32
+                        })
+                        .collect()
+                };
+                let rows = Rows::<64>::of(perspective, king, changed, &before, &after);
+                assert_eq!(rows.removed(), defined(&before));
+                assert_eq!(rows.added(), defined(&after));
+                assert!(
+                    rows.removed()
+                        .iter()
+                        .chain(rows.added())
+                        .all(|&row| (row as usize) < INPUTS)
+                );
+            }
         }
-        let network = Network::load(path).unwrap();
+    }
+
+    /// A position's first layer by its definition: for each perspective the
+    /// biases and the row of each piece, added one at a time and wrapping.
+    fn defined(network: &Network, pos: &Position) -> ([[i16; HALF]; 2], [[i32; BUCKETS]; 2]) {
+        let mut values = [[0; HALF]; 2];
+        let mut psqt = [[0; BUCKETS]; 2];
+        for perspective in Color::ALL {
+            let side = perspective as usize;
+            let flip = if perspective.is_white() { 0 } else { 56 };
+            let king = pos.king(perspective).map_or(0, |king| king as usize ^ flip);
+            values[side] = *network.biases;
+            for (square, &code) in pos.squares().iter().enumerate() {
+                if code == 0 {
+                    continue;
+                }
+                let role = usize::from(code & 7);
+                let plane = if role == Role::King as usize {
+                    10
+                } else {
+                    2 * (role - 1) + usize::from((code & 8 != 0) != perspective.is_white())
+                };
+                let row = (square ^ flip) + plane * 64 + king * 11 * 64;
+                for (value, weight) in values[side].iter_mut().zip(&network.weights[row * HALF..]) {
+                    *value = value.wrapping_add(*weight);
+                }
+                for (value, weight) in psqt[side].iter_mut().zip(&network.psqt[row * BUCKETS..]) {
+                    *value += weight;
+                }
+            }
+        }
+        (values, psqt)
+    }
+
+    /// The first layers a line updates, and those computed from scratch,
+    /// match the definition over random games: after plain moves, captures
+    /// that blow up many pieces, moves of a king and positions without one.
+    fn updates_match_refreshes_with(network: &Network) {
         let starts = [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             "rn2k2r/pp3ppp/2p5/3pP3/8/2N5/PPP2PPP/R3K2R w KQkq d6 0 1",
             "r3k2r/1P4pp/8/2pP4/8/8/p5PP/R3K2R w KQkq c6 0 1",
             "r1bqBb2/pp1pk3/8/4P1pp/8/2P5/PP3P2/R1BK3R b - - 1 11",
+            // Pieces side by side, which a capture blows up together.
+            "4k3/8/nbrqrbnn/NBRQRBNN/8/8/8/4K3 w - - 0 1",
+            "4k3/8/1nqrbn2/1rnbqr2/1NQRBN2/1RNBQR2/8/4K3 b - - 0 1",
         ];
         let mut random = Random(0x9e37_79b9_7f4a_7c15);
-        let mut cache = RefreshCache::new(&network);
-        let mut positions = 0;
+        let mut cache = RefreshCache::new(network);
+        // Positions, and those among them after a capture that changed eight
+        // squares or more, after a king's move and with a king blown up.
+        let mut seen = [0; 4];
+        let mut most = 0;
         for start in starts {
             for _ in 0..40 {
                 let mut pos: Position = from_fen(start).unwrap();
@@ -1814,35 +1911,101 @@ pub(crate) mod tests {
                         .copied()
                         .filter(|&m| pos.legal(m))
                         .collect();
-                    if moves.is_empty() || pos.king(pos.turn()).is_none() {
+                    if moves.is_empty() {
                         break;
                     }
-                    let next = pos.play(moves[(random.next() % moves.len() as u64) as usize]);
-                    if next.king(!next.turn()).is_none() || next.king(next.turn()).is_none() {
-                        break;
-                    }
+                    let m = moves[(random.next() % moves.len() as u64) as usize];
+                    let next = pos.play(m);
+                    let expected = defined(network, &next);
                     let mut updated = Accumulator::default();
                     network.update(&accumulator, &next, &mut updated, &mut cache);
+                    assert_eq!((updated.values, updated.psqt), expected);
                     let mut refreshed = Accumulator::default();
                     network.refresh(&next, &mut refreshed);
-                    assert_eq!(updated.values, refreshed.values);
-                    assert_eq!(updated.psqt, refreshed.psqt);
-                    positions += 1;
+                    assert_eq!((refreshed.values, refreshed.psqt), expected);
+                    let over = Color::ALL.iter().any(|&side| next.king(side).is_none());
+                    let changed = changed_squares(pos.squares(), next.squares()).count_ones();
+                    seen[0] += 1;
+                    most = most.max(changed);
+                    seen[1] += usize::from(changed >= 8);
+                    seen[2] += usize::from(pos.role_at(m.from()) == Some(Role::King));
+                    seen[3] += usize::from(over);
+                    if over {
+                        break;
+                    }
+                    // A plain move's first layer without the position.
+                    let m = moves[(random.next() % moves.len() as u64) as usize];
+                    let (from, to) = (m.from(), m.to());
+                    let plain = pos.role_at(from) != Some(Role::King)
+                        && pos.role_at(to).is_none()
+                        && m.promotion().is_none()
+                        && !m.is_en_passant()
+                        && !m.is_castle();
+                    if plain {
+                        let mut quiet = Accumulator::default();
+                        network.update_quiet(&accumulator, from, to, &mut quiet);
+                        assert_eq!((quiet.values, quiet.psqt), defined(network, &pos.play(m)));
+                    }
                     pos = next;
                     accumulator = updated;
                 }
             }
         }
-        assert!(positions > 5000, "{positions}");
+        assert!(
+            seen[0] > 5000 && seen[1] >= 10 && seen[2] > 500 && seen[3] > 20,
+            "{seen:?}"
+        );
+        assert_eq!(most as usize, MOVED);
+    }
+
+    /// Updates match refreshes with a first layer of random weights over
+    /// their whole range, whose sums wrap, so that a row missed or applied
+    /// twice shows.
+    #[test]
+    fn updates_match_refreshes_of_random_weights() {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        let mut values = |count: usize| -> Vec<i16> {
+            let mut values = Vec::with_capacity(count);
+            while values.len() < count {
+                let bits = random.next();
+                values.extend((0..4).map(|part| (bits >> (16 * part)) as i16));
+            }
+            values
+        };
+        let biases = values(HALF).into_boxed_slice().try_into().unwrap();
+        let weights = values(INPUTS * HALF);
+        let psqt = values(INPUTS * BUCKETS)
+            .into_iter()
+            .map(|value| i32::from(value) * 257)
+            .collect();
+        let network = Network {
+            biases,
+            weights,
+            psqt,
+            stacks: Vec::new(),
+        };
+        updates_match_refreshes_with(&network);
+    }
+
+    /// Updates match refreshes with Atomic-Stockfish's network, run3b, which
+    /// `data/fetch.sh --legacy` fetches; the test passes without checking
+    /// when `data/legacy.nnue` is absent.
+    #[test]
+    fn updates_match_refreshes() {
+        let path = Path::new("data/legacy.nnue");
+        if !path.exists() {
+            return;
+        }
+        updates_match_refreshes_with(&Network::load(path).unwrap());
     }
 
     /// The engine's own evaluations of a few positions, in internal units,
-    /// from Atomic-Stockfish's `eval` with the network bundled builds carry
+    /// from Atomic-Stockfish's `eval` with run3b
     /// (`atomic_run3b_e202_l05.nnue`); the test passes without checking when
-    /// `data/network.nnue` is absent.
+    /// `data/legacy.nnue` is absent.
     #[test]
     fn matches_the_engine() {
-        let path = Path::new("data/network.nnue");
+        let path = Path::new("data/legacy.nnue");
         if !path.exists() {
             return;
         }

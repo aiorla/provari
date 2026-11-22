@@ -33,8 +33,9 @@
 //! (`format`), or in JSON lines for a file name ending in `.jsonl`, wins for
 //! the side to move only, which `provari convert` writes in the compact
 //! format. `provari check` checks proofs with none of the prover's code
-//! (`check`), and `provari line` shows its lines. `provari uci` runs as an
-//! engine of the Universal Chess Interface, for chess GUIs and tools (`uci`).
+//! (`check`), and `provari line` shows its lines. `provari refine` makes a
+//! proof smaller within a budget (`refine`). `provari uci` runs as an engine
+//! of the Universal Chess Interface, for chess GUIs and tools (`uci`).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -56,6 +57,8 @@ use dfpn::{Dfpn, Guide};
 use search::{Search, read_proof};
 use tablebase::Tablebase;
 
+#[cfg(feature = "antichess")]
+mod cli_antichess;
 mod text;
 mod uci;
 
@@ -94,6 +97,9 @@ struct Options {
     status: Option<text::Status>,
     /// After a win, looks for shorter ones within the same budget.
     shorten: bool,
+    /// What `provari refine` makes smaller: `size` (the default) or
+    /// `positions`.
+    objective: Option<String>,
     /// The share of their room at which the proofs drop their mates in one,
     /// if before they fill: for tests of the search after, so not in `help`.
     drop_mates_at: Option<f64>,
@@ -111,6 +117,15 @@ struct Options {
     /// Where `provari line --pgn` stops the tree: at positions the proof wins
     /// within this many attacker moves.
     until: Option<u32>,
+    /// The variant proven: `atomic` (the default) or `antichess`
+    /// (`cli_antichess`).
+    variant: String,
+    /// Antichess: the MB of `--memory` for the table, the rest for proofs.
+    table: Option<usize>,
+    /// Antichess: the most MB the tables' unpacked blocks take.
+    tablebase_memory: Option<usize>,
+    /// Antichess: a bench worker keeps what earlier searches learned.
+    share: bool,
 }
 
 fn main() {
@@ -131,8 +146,10 @@ fn main() {
             Err(error) => Err(error),
         },
         "bench" => bench(rest),
+        "serve" | "unpack-tables" => antichess_only(command, rest),
         "eval" => evaluate(rest),
         "line" => line(rest),
+        "refine" => refine(rest),
         "convert" => match convert(rest) {
             Ok(true) => Ok(()),
             Ok(false) => std::process::exit(1),
@@ -147,7 +164,7 @@ fn main() {
             print!("{}", help());
             Ok(())
         }
-        "check" => match check::run(rest) {
+        "check" => match check_variant(rest) {
             Ok(true) => Ok(()),
             Ok(false) => std::process::exit(1),
             Err(error) => Err(error),
@@ -161,6 +178,52 @@ fn main() {
     if let Err(error) = result {
         eprintln!("error: {error}");
         std::process::exit(2);
+    }
+}
+
+/// The commands Antichess alone has: `serve` and `unpack-tables`
+/// (`cli_antichess`).
+fn antichess_only(command: &str, args: &[String]) -> Result<(), String> {
+    let (free, options) = parse(args)?;
+    if options.variant != "antichess" {
+        return Err(format!("{command} is for --variant antichess"));
+    }
+    #[cfg(feature = "antichess")]
+    return match command {
+        "serve" => cli_antichess::serve(&free, &options),
+        _ => cli_antichess::unpack_tables(&free),
+    };
+    #[cfg(not(feature = "antichess"))]
+    {
+        let _ = free;
+        unreachable!("parse refuses --variant antichess without the feature")
+    }
+}
+
+/// `provari check`: Atomic's proofs by `check`, which shares no code with
+/// the prover, or with `--variant antichess` Antichess's.
+fn check_variant(args: &[String]) -> Result<bool, String> {
+    let at = args.iter().position(|arg| arg == "--variant");
+    let variant = at.and_then(|at| args.get(at + 1)).map(String::as_str);
+    match (at, variant) {
+        (None, _) => check::run(args),
+        (Some(_), Some("atomic")) | (Some(_), Some("antichess")) => {
+            let at = at.unwrap_or_default();
+            let rest: Vec<String> = [&args[..at], &args[at + 2..]].concat();
+            if variant == Some("atomic") {
+                return check::run(&rest);
+            }
+            #[cfg(feature = "antichess")]
+            return cli_antichess::check(&rest);
+            #[cfg(not(feature = "antichess"))]
+            Err("this provari is built without Antichess: build it with \
+                 --features antichess-tablebases"
+                .into())
+        }
+        (Some(_), other) => Err(format!(
+            "--variant is atomic or antichess, not {}",
+            other.unwrap_or("nothing")
+        )),
     }
 }
 
@@ -190,6 +253,7 @@ Commands:
   bench POSITIONS.jsonl    searches each position of a file, several at a time
   check PROOF...           verifies proofs, independently of the search
   line PROOF ['MOVES']     shows a proof's lines (--pgn FILE writes its tree)
+  refine PROOF --out FILE  makes a proof smaller within a budget
   convert PROOF.jsonl...   converts JSON-lines proofs to the compact format
   eval NETWORK < FENS      prints a network's evaluations
   uci                      runs as a UCI engine, for chess GUIs and tools
@@ -209,8 +273,8 @@ Main options:
   --progress S             reports a search's progress every S seconds
   --json                   prove's result as JSON, for programs
 
-README.md explains every command and option:
-https://github.com/aiorla/provari
+USAGE.md explains every command and option:
+https://github.com/aiorla/provari/blob/main/USAGE.md
 ";
 
 fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
@@ -228,6 +292,7 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
         json: false,
         status: None,
         shorten: false,
+        objective: None,
         drop_mates_at: None,
         tablebases: None,
         network: None,
@@ -238,6 +303,10 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
         out: None,
         pgn: None,
         until: None,
+        variant: "atomic".to_owned(),
+        table: None,
+        tablebase_memory: None,
+        share: false,
     };
     let mut free = Vec::new();
     let mut iter = args.iter();
@@ -246,7 +315,10 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
         match arg.as_str() {
             "--search" => options.search = value()?,
             "--attacker" => options.attacker = Some(side(&value()?)?),
-            "--seconds" => options.seconds = Some(value()?.parse().map_err(|_| "bad --seconds")?),
+            "--seconds" => match value()?.parse() {
+                Ok(seconds) if (0.0..=1e9).contains(&seconds) => options.seconds = Some(seconds),
+                _ => return Err("bad --seconds".into()),
+            },
             "--nodes" => options.nodes = Some(value()?.parse().map_err(|_| "bad --nodes")?),
             "--seed" => options.seed = value()?.parse().map_err(|_| "bad --seed")?,
             "--threads" => match value()?.parse() {
@@ -264,7 +336,10 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
                 _ => return Err("--progress takes seconds, 0 for none".into()),
             },
             "--json" => options.json = true,
-            "--workers" => options.workers = value()?.parse().map_err(|_| "bad --workers")?,
+            "--workers" => match value()?.parse() {
+                Ok(workers) if workers >= 1 => options.workers = workers,
+                _ => return Err("--workers takes a number from 1".into()),
+            },
             "--tablebases" => options.tablebases = Some(value()?.into()),
             "--network" => options.network = Some(value()?.into()),
             "--model" => options.model = Some(value()?.into()),
@@ -276,6 +351,12 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
             },
             "--no-eval" => options.guide = Some("none".to_owned()),
             "--shorten" => options.shorten = true,
+            "--objective" => match value()?.as_str() {
+                objective @ ("size" | "positions") => {
+                    options.objective = Some(objective.to_owned())
+                }
+                other => return Err(format!("--objective is size or positions, not {other}")),
+            },
             "--drop-mates-at" => {
                 options.drop_mates_at = Some(value()?.parse().map_err(|_| "bad --drop-mates-at")?)
             }
@@ -283,6 +364,16 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
             "--out" => options.out = Some(value()?.into()),
             "--pgn" => options.pgn = Some(value()?.into()),
             "--until" => options.until = Some(value()?.parse().map_err(|_| "bad --until")?),
+            "--variant" => match value()?.as_str() {
+                variant @ ("atomic" | "antichess") => options.variant = variant.to_owned(),
+                other => return Err(format!("--variant is atomic or antichess, not {other}")),
+            },
+            "--table" => options.table = Some(value()?.parse().map_err(|_| "bad --table")?),
+            "--tablebase-memory" => {
+                options.tablebase_memory =
+                    Some(value()?.parse().map_err(|_| "bad --tablebase-memory")?)
+            }
+            "--share" => options.share = true,
             // A misspelled option would otherwise pass for a FEN's field, a
             // move or a file, and a run go on without it.
             unknown if unknown.starts_with("--") => {
@@ -290,6 +381,22 @@ fn parse(args: &[String]) -> Result<(Vec<String>, Options), String> {
             }
             _ => free.push(arg.clone()),
         }
+    }
+    if options.variant == "atomic" {
+        let antichess = [
+            ("--table", options.table.is_some()),
+            ("--tablebase-memory", options.tablebase_memory.is_some()),
+            ("--share", options.share),
+        ];
+        if let Some((name, _)) = antichess.iter().find(|(_, given)| *given) {
+            return Err(format!("{name} is for --variant antichess"));
+        }
+    }
+    #[cfg(not(feature = "antichess"))]
+    if options.variant == "antichess" {
+        return Err("this provari is built without Antichess: build it with \
+                    --features antichess-tablebases"
+            .into());
     }
     if options.shorten && options.search == "exhaustive" {
         return Err("--shorten is for df-pn: the baseline finds the shortest win itself".into());
@@ -383,15 +490,19 @@ impl Options {
     /// search of 16 GB on a 24 GB Mac had part of its memory compressed and ran
     /// at a fifth of its speed. A server running nothing else can allow more.
     fn check_memory(&self, searches: usize) -> Result<(), String> {
-        let needed = self.memory_mb() * searches;
+        self.check_memory_mb(self.memory_mb(), searches)
+    }
+
+    /// `check_memory` for searches of `each` MB.
+    fn check_memory_mb(&self, each: usize, searches: usize) -> Result<(), String> {
+        let needed = each * searches;
         let Some(most) = self.max_memory.or_else(|| physical_mb().map(|mb| mb / 2)) else {
             return Ok(());
         };
         if needed > most {
             return Err(format!(
-                "{searches} × {} MB of searches exceed the {most} MB allowed: give fewer \
-                 --workers, less --memory, or more --max-memory",
-                self.memory_mb()
+                "{searches} × {each} MB of searches exceed the {most} MB allowed: give fewer \
+                 --workers, less --memory, or more --max-memory"
             ));
         }
         Ok(())
@@ -608,7 +719,7 @@ fn run(
     let longest = options.status.is_some();
     let mut started = Instant::now();
     let mut shortened = None;
-    let (moves, first_ms, nodes, (full, dropped), root_numbers, written, hardest) =
+    let (moves, first_ms, nodes, (full, dropped, short_drops), root_numbers, written, hardest) =
         if options.search == "exhaustive" {
             // The baseline has no node budget: only a time limit.
             let seconds = options.seconds.unwrap_or(DEFAULT_SECONDS);
@@ -628,14 +739,14 @@ fn run(
                     tablebase,
                     proof,
                     longest,
-                    |_, key| search.winning_move(key),
+                    |_, key, _| search.winning_move(key),
                 )
             });
             (
                 moves,
                 first_ms,
                 search.nodes,
-                (false, None),
+                (false, None, 0),
                 None,
                 written,
                 None,
@@ -662,7 +773,7 @@ fn run(
                     tablebase,
                     None,
                     false,
-                    |pos, key| search.winning_move(pos, key),
+                    |pos, key, furthest| search.winning_move(pos, key, furthest),
                 )
                 .map_or(length, |written| written.length);
                 let mut done = Shortened {
@@ -684,18 +795,24 @@ fn run(
                 shortened = Some(done);
             }
             let written = moves.map(|moves| {
-                write_proof(
-                    &root,
-                    attacker,
-                    fen,
-                    moves,
-                    tablebase,
-                    proof,
-                    longest,
-                    |pos, key| search.winning_move(pos, key),
-                )
+                search.with_moves_ahead(options.threads, |winning_move| {
+                    write_proof(
+                        &root,
+                        attacker,
+                        fen,
+                        moves,
+                        tablebase,
+                        proof,
+                        longest,
+                        winning_move,
+                    )
+                })
             });
-            let full = (search.proofs_full(), search.mates_dropped);
+            let full = (
+                search.proofs_full(),
+                search.mates_dropped,
+                search.short_drops(),
+            );
             let hardest = moves.is_none().then(|| search.line());
             (
                 moves,
@@ -739,12 +856,24 @@ fn run(
         result["passes"] = json!(shortened.passes);
         result["mate_ms"] = json!(shortened.ms);
         result["mate_nodes"] = json!(shortened.nodes);
-        result["shortest"] = json!(shortened.shortest);
+        result["shortest"] = json!(shortened.shortest && !longer(&written, moves));
+    }
+    // A proof written again with the proofs that hold furthest, one move a
+    // position: it can be longer than the search's own.
+    if let Some(Ok(Written {
+        rewritten: true, ..
+    })) = &written
+    {
+        result["rewritten"] = json!(true);
     }
     // When the proofs dropped their mates in one, as they do when they first
-    // fill.
+    // fill, and how many times they dropped their short proofs, as they do
+    // each time they fill after that.
     if let Some(nodes) = dropped {
         result["mates_dropped"] = json!(nodes);
+    }
+    if short_drops > 0 {
+        result["short_drops"] = json!(short_drops);
     }
     if full {
         // A win found before the proofs filled, while shortening it, stands.
@@ -816,15 +945,28 @@ struct Shortened {
     shortest: bool,
 }
 
-/// A proof read back: its length as written, the result field for its size,
+/// A proof read back: its length as written, whether it was written again
+/// with the proofs that hold furthest (`format::walk_search`), which can
+/// make it longer than the search's own, the result field for its size,
 /// with the size, whether lines may end at tablebase wins, and a longest
 /// line, with whether it ends at one, if asked for.
 struct Written {
     length: u32,
+    rewritten: bool,
     field: &'static str,
     count: usize,
     tablebases: bool,
     longest: Option<(Vec<shakmaty::Move>, bool)>,
+}
+
+/// Whether a proof was written again and came out longer than the search's
+/// own length: `mate` is then the written proof's, and not the shortest win
+/// even where the search settled what that is.
+fn longer(written: &Option<Result<Written, String>>, moves: Option<u32>) -> bool {
+    match (written, moves) {
+        (Some(Ok(written)), Some(moves)) => written.rewritten && written.length > moves,
+        _ => false,
+    }
 }
 
 /// Whether a proof file is in JSON lines, by its name; any other is compact.
@@ -849,13 +991,14 @@ fn write_proof(
     tablebase: Option<&Tablebase>,
     path: Option<&Path>,
     longest: bool,
-    mut winning_move: impl FnMut(&Atomic, &search::Key) -> Option<shakmaty::Move>,
+    mut winning_move: impl FnMut(&Atomic, &search::Key, bool) -> Option<shakmaty::Move>,
 ) -> Result<Written, String> {
     if path.is_none_or(|path| !is_jsonl(path)) {
-        let (header, indices) = format::walk(root, attacker, tablebase, |pos| {
-            winning_move(&pos.to_atomic(), &(pos.hash(), pos.halfmoves()))
-                .and_then(|m| format::board_move(pos, &m))
-        })?;
+        let (header, indices, rewritten) =
+            format::walk_search(root, attacker, tablebase, |pos, furthest| {
+                winning_move(&pos.to_atomic(), &(pos.hash(), pos.halfmoves()), furthest)
+                    .and_then(|m| format::board_move(pos, &m))
+            })?;
         if let Some(path) = path {
             format::save(path, &format::file(&header, &indices)?)?;
         }
@@ -868,6 +1011,7 @@ fn write_proof(
         };
         return Ok(Written {
             length: header.moves,
+            rewritten,
             field: "proof_moves",
             count: header.positions as usize,
             tablebases: header.tablebases > 0,
@@ -876,32 +1020,56 @@ fn write_proof(
     }
     let error = |error: std::io::Error| format!("cannot write the proof: {error}");
     let partial = path.map(|path| path.with_extension("partial"));
-    let mut out = match &partial {
-        Some(partial) => Some(BufWriter::new(File::create(partial).map_err(error)?)),
-        None => None,
-    };
-    if let Some(out) = &mut out {
-        writeln!(out, "{}", json!({ "root": fen, "moves": moves })).map_err(error)?;
-    }
-    let (mut strategy, mut tablebases) = (walk::Moves::new(), false);
-    let positions = read_proof(root, tablebase, winning_move, |pos, m| {
-        tablebases |= m.is_none();
-        if longest {
-            strategy.entry(search::hash(pos)).or_insert(m);
+    // With each position's shortest proof at its counter; if a position then
+    // has two moves at two counters, again with the proofs that hold
+    // furthest, one move a position (`format::walk_search`), and the length
+    // those take, which the header gives.
+    let mut furthest = false;
+    let mut length = moves;
+    let (positions, strategy, tablebases) = loop {
+        let mut out = match &partial {
+            Some(partial) => Some(BufWriter::new(File::create(partial).map_err(error)?)),
+            None => None,
+        };
+        if let Some(out) = &mut out {
+            writeln!(out, "{}", json!({ "root": fen, "moves": length })).map_err(error)?;
         }
-        let Some(out) = &mut out else {
-            return Ok(());
-        };
-        let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
-        let line = match m {
-            Some(m) => json!({ "fen": fen, "move": UciMove::from_standard(m).to_string() }),
-            None => json!({ "fen": fen, "tablebase": "win" }),
-        };
-        writeln!(out, "{line}").map_err(error)
-    })?;
-    if let (Some(out), Some(partial), Some(path)) = (out, partial, path) {
-        out.into_inner()
-            .map_err(|failed| error(failed.into_error()))?;
+        let (mut strategy, mut tablebases) = (walk::Moves::new(), false);
+        let (positions, mixed) = read_proof(
+            root,
+            tablebase,
+            |pos, key| winning_move(pos, key, furthest),
+            |pos, m| {
+                tablebases |= m.is_none();
+                if longest {
+                    strategy.entry(search::hash(pos)).or_insert(m);
+                }
+                let Some(out) = &mut out else {
+                    return Ok(());
+                };
+                let fen = Fen::from_position(pos, EnPassantMode::Legal).to_string();
+                let line = match m {
+                    Some(m) => json!({ "fen": fen, "move": UciMove::from_standard(m).to_string() }),
+                    None => json!({ "fen": fen, "tablebase": "win" }),
+                };
+                writeln!(out, "{line}").map_err(error)
+            },
+        )?;
+        if mixed && !furthest {
+            furthest = true;
+            length = furthest_length(root, attacker, tablebase, &mut winning_move)?;
+            continue;
+        }
+        if mixed {
+            return Err(format::TWO_MOVES.into());
+        }
+        if let Some(out) = out {
+            out.into_inner()
+                .map_err(|failed| error(failed.into_error()))?;
+        }
+        break (positions, strategy, tablebases);
+    };
+    if let (Some(partial), Some(path)) = (partial, path) {
         fs::rename(partial, path).map_err(error)?;
     }
     let longest = match longest {
@@ -909,12 +1077,39 @@ fn write_proof(
         false => None,
     };
     Ok(Written {
-        length: moves,
+        length,
+        rewritten: furthest,
         field: "proof_positions",
         count: positions,
         tablebases,
         longest,
     })
+}
+
+/// The length of the proof that JSON lines list with the proofs that hold
+/// furthest, as a proof's lines measure it (`walk::measure`): the search's
+/// own length is of its shortest proofs, and these can be longer.
+fn furthest_length(
+    root: &Atomic,
+    attacker: Color,
+    tablebase: Option<&Tablebase>,
+    mut winning_move: impl FnMut(&Atomic, &search::Key, bool) -> Option<shakmaty::Move>,
+) -> Result<u32, String> {
+    let mut strategy = walk::Moves::new();
+    let (_, mixed) = read_proof(
+        root,
+        tablebase,
+        |pos, key| winning_move(pos, key, true),
+        |pos, m| {
+            strategy.entry(search::hash(pos)).or_insert(m);
+            Ok(())
+        },
+    )?;
+    if mixed {
+        return Err(format::TWO_MOVES.into());
+    }
+    let mut walk = walk::Walk::measures_only();
+    Ok(walk::measure(root, attacker, &strategy, tablebase, &mut walk)?.length)
 }
 
 /// Writes proofs in JSON lines again in the compact format: `provari convert
@@ -967,6 +1162,57 @@ fn convert(args: &[String]) -> Result<bool, String> {
     Ok(converted.into_inner().unwrap())
 }
 
+/// `provari refine PROOF --out REFINED.pvr`: makes an Atomic proof, in the
+/// compact format from either side's move or in JSON lines, smaller within a
+/// budget for all its searches together, `--nodes`, `--seconds` or both, and
+/// writes it in the compact format (`provari::refine`). `--objective size`,
+/// the default, makes its tree smaller, `positions` the distinct positions
+/// it lists. The searches take the usual `--tablebases`, `--network`,
+/// `--model`, `--guide` and `--seed`.
+fn refine(args: &[String]) -> Result<(), String> {
+    let (free, options) = parse(args)?;
+    if options.variant != "atomic" {
+        return Err("refine is for Atomic's proofs".into());
+    }
+    let [input] = free.as_slice() else {
+        return Err(
+            "usage: provari refine PROOF --out REFINED.pvr --nodes N | --seconds S \
+                    [--objective size|positions]"
+                .into(),
+        );
+    };
+    let out = options.out.clone().ok_or("needs --out")?;
+    let objective = match options.objective.as_deref() {
+        Some("positions") => provari::refine::Objective::Positions,
+        _ => provari::refine::Objective::Size,
+    };
+    let inputs = Inputs::open(&options, true)?;
+    let tablebase = inputs.tablebase.as_ref();
+    let result = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn_scoped(scope, || {
+                let (root, attacker, moves) = read_moves(input, tablebase)?;
+                let settings = provari::refine::Settings {
+                    objective,
+                    nodes: options.nodes,
+                    seconds: options.seconds,
+                    seed: options.seed,
+                    guide: inputs.guide(&options),
+                };
+                let (moves, result) =
+                    provari::refine::refine(&root, attacker, moves, tablebase, &settings)?;
+                provari::refine::write(&root, attacker, tablebase, &out, &moves)?;
+                Ok::<_, String>(result)
+            })
+            .expect("cannot start the refinement")
+            .join()
+            .expect("the refinement failed")
+    })?;
+    println!("{result}");
+    Ok(())
+}
+
 /// Writes a proof in JSON lines in the compact format, through a temporary
 /// file so that a proof there is always whole.
 fn convert_proof(
@@ -1005,8 +1251,12 @@ fn evaluate(args: &[String]) -> Result<(), String> {
 /// error.
 fn prove(args: &[String]) -> Result<bool, String> {
     let (free, mut options) = parse(args)?;
-    options.check_memory(1)?;
     let fen = free.join(" ");
+    #[cfg(feature = "antichess")]
+    if options.variant == "antichess" {
+        return cli_antichess::prove(&fen, &options);
+    }
+    options.check_memory(1)?;
     if !options.json {
         options.status = Some(text::Status::new(options.progress));
     }
@@ -1049,6 +1299,10 @@ fn prove(args: &[String]) -> Result<bool, String> {
 /// Searches each position of a JSONL benchmark and appends a result for each.
 fn bench(args: &[String]) -> Result<(), String> {
     let (free, options) = parse(args)?;
+    #[cfg(feature = "antichess")]
+    if options.variant == "antichess" {
+        return cli_antichess::bench(&free, &options);
+    }
     options.check_memory(options.workers)?;
     if let Some(dir) = &options.proofs {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -1179,6 +1433,18 @@ fn each(
     key: &str,
     job: impl Fn(&Value) -> Vec<Value> + Sync,
 ) -> Result<(), String> {
+    each_with(free, options, key, || (), |(), item| job(item))
+}
+
+/// `each`, with what each worker keeps from one job to its next, which
+/// `start` makes on the worker's own thread.
+fn each_with<S>(
+    free: &[String],
+    options: &Options,
+    key: &str,
+    start: impl Fn() -> S + Sync,
+    job: impl Fn(&mut S, &Value) -> Vec<Value> + Sync,
+) -> Result<(), String> {
     let input = free.first().ok_or("needs an input file")?;
     let out = options.out.clone().ok_or("needs --out")?;
     let done: Vec<String> = match File::open(&out) {
@@ -1207,13 +1473,18 @@ fn each(
         }
     }
     let queue = Mutex::new(items.iter());
-    let output = Mutex::new(
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&out)
-            .map_err(|e| format!("{}: {e}", out.display()))?,
-    );
+    let mut appended = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&out)
+        .map_err(|e| format!("{}: {e}", out.display()))?;
+    // A run stopped while writing leaves its last line cut: ending it keeps
+    // the lines written from now on whole.
+    let cut = fs::read(&out).is_ok_and(|bytes| bytes.last().is_some_and(|&b| b != b'\n'));
+    if cut {
+        writeln!(appended).map_err(|e| format!("{}: {e}", out.display()))?;
+    }
+    let output = Mutex::new(appended);
     let total = items.len();
     let finished = Mutex::new(0usize);
     std::thread::scope(|scope| {
@@ -1221,11 +1492,12 @@ fn each(
             // Deep lines recurse deeply.
             let worker = std::thread::Builder::new().stack_size(STACK);
             let spawned = worker.spawn_scoped(scope, || {
+                let mut kept = start();
                 loop {
                     let Some(item) = queue.lock().unwrap().next() else {
                         break;
                     };
-                    let lines = job(item);
+                    let lines = job(&mut kept, item);
                     let mut file = output.lock().unwrap();
                     for line in lines {
                         writeln!(file, "{line}").ok();
@@ -1247,7 +1519,7 @@ mod tests {
     use std::path::Path;
 
     use serde_json::{Value, json};
-    use shakmaty::Color;
+    use shakmaty::{Color, Position as _, uci::UciMove, variant::Atomic};
 
     use super::{Inputs, parse, run};
 
@@ -1349,6 +1621,77 @@ mod tests {
         assert!(parse(&args(&["--threads", "2", "--search", "exhaustive"])).is_err());
     }
 
+    /// `--variant antichess` proves, benches and checks Antichess: a bench's
+    /// proofs pass `check`, a damaged one fails it, and Atomic's options and
+    /// Antichess's are each refused for the other variant.
+    #[cfg(feature = "antichess")]
+    #[test]
+    fn proves_benches_and_checks_antichess() {
+        let args =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|arg| (*arg).to_owned()).collect() };
+        let base = std::env::temp_dir().join(format!("provari-antichess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // After 1. e3 d6, which White wins in 14 moves and not in 8.
+        let fen = "rnbqkbnr/ppp1pppp/3p4/8/8/4P3/PPPP1PPP/RNBQKBNR w - - 0 2";
+        let positions = base.join("positions.jsonl");
+        std::fs::write(
+            &positions,
+            format!(
+                "{}\n{}\n",
+                json!({ "id": "won", "fen": fen, "most": 14 }),
+                json!({ "id": "refuted", "fen": fen, "most": 8 }),
+            ),
+        )
+        .unwrap();
+        let (out, proofs) = (base.join("results.jsonl"), base.join("proofs"));
+        let given = [
+            positions.to_str().unwrap(),
+            "--variant",
+            "antichess",
+            "--out",
+            out.to_str().unwrap(),
+            "--proofs",
+            proofs.to_str().unwrap(),
+            "--memory",
+            "16",
+            "--threads",
+            "2",
+            "--workers",
+            "2",
+        ];
+        super::bench(&args(&given)).unwrap();
+        let results: Vec<Value> = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let result = |id: &str| results.iter().find(|r| r["id"] == id).unwrap().clone();
+        assert_eq!(result("won")["found"], true);
+        assert_eq!(result("won")["threads"], 2);
+        assert_eq!(result("refuted")["refuted"], true);
+        let proof = proofs.join("won.apr");
+        let path = proof.to_str().unwrap();
+        assert_eq!(
+            super::check_variant(&args(&["--variant", "antichess", path])),
+            Ok(true)
+        );
+        let mut bytes = std::fs::read(&proof).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        let damaged = base.join("damaged.apr");
+        std::fs::write(&damaged, bytes).unwrap();
+        let damaged = damaged.to_str().unwrap();
+        assert_eq!(
+            super::check_variant(&args(&["--variant", "antichess", damaged])),
+            Ok(false)
+        );
+        assert!(super::prove(&args(&[fen, "--variant", "antichess", "--seed", "3"])).is_err());
+        assert!(parse(&args(&["--table", "4"])).is_err());
+        assert!(parse(&args(&["--variant", "crazyhouse"])).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// The baseline finds the shortest win itself, so it refuses `--shorten`.
     #[test]
     fn shortens_only_proof_number_search() {
@@ -1401,6 +1744,114 @@ mod tests {
         assert_eq!(convert(&[&proof]), Ok(true));
         assert_eq!(convert(&[&proof, &base.join("missing.jsonl")]), Ok(false));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A proof in JSON lines of a win whose positions have two moves at two
+    /// counters is written again with one move a position: White's rook
+    /// positions A (rook c7, king e8) and B (rook f7, king d8) each reach
+    /// the other by a rook move and the king's only reply, and each win by a
+    /// check and a mate; Black's pawn reaches h5 at once or a move later,
+    /// so White meets A and B at the counters 2 and 4 and, after its rook
+    /// has gone round, at 10 and 8. Below the counter 6 A goes to B and B
+    /// checks, and from 6 on, or asked for the moves that hold furthest, B
+    /// goes to A and A checks: the first writing links A to B to A, which
+    /// the checker refuses (`search`'s test), and the proof left is the
+    /// second.
+    #[test]
+    fn json_lines_keep_one_move_a_position() {
+        let fen = "2Nk1N2/2R4p/3PP3/8/7P/8/8/6K1 w - - 0 1";
+        let root = provari::position(fen).unwrap();
+        let script = |pos: &Atomic, furthest: bool| {
+            let high = furthest || pos.halfmoves() >= 6;
+            let board = pos.board().to_string();
+            let uci = match (board.as_str(), high) {
+                ("2Nk1N2/2R4p/3PP3/8/7P/8/8/6K1", _) => "g1h1",
+                ("2N1kN2/2R4p/3PP3/8/7P/8/8/7K" | "2N1kN2/2R5/3PP2p/8/7P/8/7K/8", _) => "c7e7",
+                ("2Nk1N2/2R5/3PP2p/8/7P/8/8/7K" | "2Nk1N2/2R5/3PP3/7p/7P/8/8/7K", _) => "h1h2",
+                ("2N1kN2/2R5/3PP3/7p/7P/8/7K/8", true) => "c7e7",
+                ("2N1kN2/2R5/3PP3/7p/7P/8/7K/8", false) => "c7f7",
+                ("2Nk1N2/5R2/3PP3/7p/7P/8/7K/8", true) => "f7c7",
+                ("2Nk1N2/5R2/3PP3/7p/7P/8/7K/8", false) => "f7d7",
+                ("2Nk1N2/2R5/3PP3/7p/7P/8/7K/8", _) => "c7b7",
+                ("2N1kN2/1R6/3PP3/7p/7P/8/7K/8", _) => "b7a7",
+                ("2Nk1N2/R7/3PP3/7p/7P/8/7K/8", _) => "a7g7",
+                ("2N1kN2/6R1/3PP3/7p/7P/8/7K/8", _) => "g7f7",
+                (board, _) if board.starts_with("2Nk1N2/4R") => "e7e8",
+                (board, _) if board.starts_with("2N1kN2/3R") => "d7d8",
+                _ => return None,
+            };
+            uci.parse::<UciMove>().ok()?.to_move(pos).ok()
+        };
+        let base = std::env::temp_dir().join(format!("provari-circle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // The search's own length is 7 here, whatever the proof written takes.
+        let write = |name: &str, shortest: bool, again: bool| {
+            let path = base.join(name);
+            super::write_proof(
+                &root,
+                Color::White,
+                fen,
+                7,
+                None,
+                Some(&path),
+                false,
+                |pos, _, furthest| script(pos, !shortest || (furthest && again)),
+            )
+            .map(|written| {
+                let bytes = std::fs::read(&path).unwrap();
+                let checked = provari::check::check_proof(name, &bytes, None);
+                assert_eq!(checked["valid"], true, "{checked}");
+                let header = bytes.split(|&byte| byte == b'\n').next().unwrap();
+                let header: Value = serde_json::from_slice(header).unwrap();
+                (written, header["moves"].as_u64().unwrap())
+            })
+        };
+        // A source that gives two moves even when asked for the ones that
+        // hold furthest leaves no proof.
+        assert_eq!(
+            write("first.jsonl", true, false).err().unwrap(),
+            provari::format::TWO_MOVES
+        );
+        assert!(!base.join("first.jsonl").exists());
+        // Written again, the proof tells so, and its length is its own, in
+        // its header too: the rook's way round takes 9 moves.
+        let (written, header) = write("win.jsonl", true, true).unwrap();
+        assert!(written.rewritten);
+        assert_eq!((written.count, written.length, header), (16, 9, 9));
+        let (written, header) = write("win.pvr", true, true).unwrap();
+        assert!(written.rewritten);
+        assert_eq!((written.length, header), (9, 9));
+        // One move a position from the start: nothing is written again, and
+        // JSON lines keep the search's length.
+        let (written, header) = write("once.jsonl", false, false).unwrap();
+        assert!(!written.rewritten);
+        assert_eq!((written.count, written.length, header), (16, 7, 7));
+        let (written, _) = write("once.pvr", false, false).unwrap();
+        assert!(!written.rewritten);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A proof written again that came out longer than the search's own
+    /// length is not the shortest win, whatever the search settled; one as
+    /// long, or one not written again, leaves the search's word.
+    #[test]
+    fn a_longer_rewrite_is_not_the_shortest() {
+        let written = |length, rewritten| {
+            Some(Ok(super::Written {
+                length,
+                rewritten,
+                field: "proof_moves",
+                count: 0,
+                tablebases: false,
+                longest: None,
+            }))
+        };
+        assert!(super::longer(&written(9, true), Some(7)));
+        assert!(!super::longer(&written(7, true), Some(7)));
+        assert!(!super::longer(&written(6, false), Some(7)));
+        assert!(!super::longer(&Some(Err("failed".into())), Some(7)));
+        assert!(!super::longer(&None, Some(7)));
     }
 
     /// Every system the tests run on tells its memory, which `--max-memory`
@@ -1587,5 +2038,19 @@ mod tests {
             memory(&["--threads", "8", "--nodes", "32000000"]),
             (1024, 512)
         );
+    }
+
+    #[test]
+    fn refuses_invalid_seconds_and_workers() {
+        for args in [
+            ["--seconds", "-1"].as_slice(),
+            &["--seconds", "NaN"],
+            &["--seconds", "inf"],
+            &["--seconds", "2e9"],
+            &["--workers", "0"],
+        ] {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
     }
 }

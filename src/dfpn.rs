@@ -1,46 +1,37 @@
-//! Depth-first proof-number search (df-pn, Nagai 2002) for Atomic wins.
+//! Depth-first proof-number search (df-pn, Nagai 2002) for wins in chess
+//! variants: the search itself, which every variant shares, and the
+//! `Variant` trait, through which a variant says what it alone knows. Atomic
+//! is the variant provari proves (`atomic`).
 //!
 //! Every position has a proof number, how many unsettled leaves must still be
 //! won to win it, and a disproof number, how many must fail to refute it. The
 //! search always descends into the child that looks cheapest to settle, within
 //! thresholds that keep it depth-first, and uses the 1+ε trick against
-//! thrashing. Explosions in one move, either way, are settled without a search,
-//! and so are checks and double threats after which every defence lets the
-//! king be exploded.
-//! Forcing attacker moves start cheaper than quiet ones, so they are tried
-//! first while the quiet ones stay available: a check starts at its number of
-//! evasions that survive, and a threat to explode the king cheaper the more
-//! ways it threatens, unless its piece is cheap to blow up, and a plain move
-//! whose piece is cheap to blow up starts dearer than the others. Defences
-//! unlikely to refute start harder to refute, and ties go to the moves that
-//! proved or refuted most so far (the history heuristic). When a defence is
-//! proven, its proof is replayed on the other defences (Kawano's simulation),
-//! which proves those it also answers. So is a threat: when a defender
-//! position not in check is first expanded, a win the attacker would have at
-//! once if the defender passed is replayed on every defence, and only those
-//! that parry it stay open.
+//! thrashing. The variant scores a position's children before the search
+//! descends: which are settled at once, and the starting numbers of the
+//! others, as its rules and its guide judge them.
+//!
+//! A variant is a type parameter of the search, so that each variant compiles
+//! to its own search and none tests at run time which variant it searches: what
+//! one variant does at every node costs another nothing.
 //!
 //! A position keeps its children's numbers while it is searched and updates
-//! only the child it searched. Children are scored from their moves' effects;
-//! a child position is built only to descend into it. The attacker's plain
-//! moves, quiet ones that neither check nor threaten, wait together as one
-//! child, scored only when the search first wants one of them (as
-//! KomoringHeights delays expansions): most positions never want one. When
-//! they are scored, the network evaluates the position after each, and those
-//! it likes less than its best few start dearer.
-//!
-//! Each expanded position is evaluated once, by a hand-crafted evaluation,
-//! Atomic-Stockfish's network, or a provability model, and its prospects for
-//! the attacker, as a step from behind to ahead, scale its new children's
-//! starting numbers (EF-PN, Winands and Schadd): lines that look winnable
-//! start cheaper to prove and harder to refute.
+//! only the child it searched. A variant may hold some moves back as one
+//! child, a group, opened only when the search first wants one of them.
 //!
 //! Positions are keyed without the 50-move counter, so that move orders share
 //! their work. A proof records its length in attacker moves and the highest
 //! counter it holds at, and only a proof that is shorter or holds further
 //! joins it, so lengths shrink along every line of a proof and none can repeat
-//! a position. Proofs that come out the same whenever worked out again, such
-//! as an explosion at once, are not kept. Repeating a position of the current
+//! a position. A position may so keep a short proof up to a low counter and a
+//! longer one, with another move, up to a higher one; a proof's walk that
+//! would write both writes the one that holds furthest instead (`kept_proof`),
+//! as the format lets no two moves of a position link positions in a circle.
+//! Proofs that come out the same whenever worked out again are not kept; when
+//! the kept ones fill their memory, the mates in one go too, and each time
+//! they fill after that, every proof of at most two moves (`drop_short`): the
+//! search then works one out again where it needs it, and stops only once the
+//! longer proofs alone fill the memory. Repeating a position of the current
 //! line, the 50-move limit, and stalemate count as draws. A refutation that
 //! relies on a repetition applies only while the repeated position is on the
 //! line, and one that relies on the 50-move limit only from the same counter
@@ -52,7 +43,7 @@
 //! position refuted for lack of moves may be won with more. A tablebase win
 //! counts as won where it is reached, as a proof's length counts it
 //! (FORMAT.md), with any moves left; an exact search plays it out instead,
-//! so that its every line ends in a mate or an explosion (`set_exact`).
+//! so that its every line ends in a finished game (`set_exact`).
 //!
 //! Threads may search a position together (`try_with_threads`), as chess
 //! engines' threads do (Lazy SMP): they share the table and the proofs, each
@@ -63,9 +54,9 @@
 //! thread also sees a child as dearer the more of the others search below
 //! it, as Kaneko's virtual numbers do (2010), so that the threads spread out
 //! over the tree rather than follow one line. The first to settle the root
-//! stops the others. Dropping the mates in one and rebuilding the table's
-//! filter move what every thread reads, so one thread makes them while the
-//! others wait (`pause`).
+//! stops the others. Dropping the mates in one or the short proofs and
+//! rebuilding the table's filter move what every thread reads, so one thread
+//! makes them while the others wait (`pause`).
 //!
 //! A search can report how it goes (`set_progress`): besides its nodes, its
 //! line, the first plies of the path it is on, which is the attacker's
@@ -79,7 +70,6 @@
 //! search's time, so a search keeps its line only while it reports, or when
 //! asked (`keep_line`).
 
-use std::cmp::Reverse;
 use std::collections::TryReserveError;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -87,76 +77,42 @@ use std::time::Duration;
 
 use crate::clock::Instant;
 
-use shakmaty::{Color, uci::UciMove, variant::Atomic};
+use shakmaty::Color;
 
-use crate::board::{Effect, Move, Position};
-use crate::model::{FEATURES, Model};
-use crate::moves::{self, Mover};
-use crate::nnue::{Accumulator, Network, RefreshCache, Transformed};
+use crate::board::{Move, Position};
+use crate::model::FEATURES;
 use crate::pause::Pause;
 use crate::proofs::{Proof, Proofs};
-use crate::search::{Key, Status, status};
+use crate::search::Status;
 use crate::table::{self, Known, Table};
-use crate::tablebase::{Tablebase, Verdict};
+use crate::variant;
 
 const INFINITY: u32 = 1 << 30;
-/// The starting proof numbers of attacker moves: a check or a threat to
-/// explode the king two ways starts at 1, one threat at `THREAT`, and a quiet
-/// move at `QUIET`.
-const THREAT: u32 = 4;
-const QUIET: u32 = 9;
-/// A plain move whose piece the defender can blow up without losing
-/// material, after Stockfish's ordering, which ranks a quiet move lower when
-/// a cheaper piece attacks where it lands.
-const HANGING: u32 = 15;
-/// When the plain moves' group opens, the network evaluates the position
-/// after each, and all but the best `GRADED` start at `UNGRADED` times their
-/// number.
-const GRADED: usize = 3;
-const UNGRADED: u32 = 3;
-/// A quiet move's starting number when the provability model was fitted,
-/// which its feature of the cheapest child's number keeps as its scale.
-const FITTED_QUIET: f32 = 16.0;
-/// A threat from a piece the defender can blow up without losing material.
-const WEAK_THREAT: u32 = 8;
-/// A check starts at its number of evasions that do not lose at once, up to
-/// this many.
-const EVASIONS: u32 = 8;
-/// A defence unlikely to refute starts at this disproof number, so that
-/// likelier ones are tried first.
-const UNLIKELY: u32 = 2;
-/// How many positions a replay of a sibling's proof may visit.
-const SIMULATION: u32 = 16;
+
 /// The highest 50-move counter at which the game goes on.
 const LAST: u32 = 99;
+
 /// The depth of a refutation's repetition when it relies on none.
 const ANY_LINE: u32 = u32::MAX;
+
 /// Where the table keeps a position's plain moves together.
 const GROUP: u64 = 0x2545_f491_4f6c_dd1d;
-/// EF-PN's parameters: how much a parent's evaluation weighs on its new
-/// children's starting numbers, and the evaluation that decides a position:
-/// five pawns for the network, 500 for the hand-crafted evaluation.
-const EF_A: u32 = 10;
-const EF_B: u32 = 5;
-/// How steeply a model's chance scales the starting numbers: by 10^MAGNITUDE
-/// for each unit of its logit, down for proof numbers and up for disproof
-/// numbers.
-const MAGNITUDE: f32 = 0.25;
-const DECISIVE: i32 = 5 * 208;
-const HAND_DECISIVE: i32 = 500;
 
 /// The plies of its line a search keeps for its progress lines.
 const LINE: usize = 16;
 
 /// What spreads a seed over all bits (`set_seed`).
 const SEED_SPREAD: u64 = 0xD1B5_4A32_D192_ED03;
+
 /// The bits of a position's hash that pick its slot among the threads' marks
 /// (`Store::busy`).
 const BUSY_BITS: u32 = 18;
+
 /// How much a child's deciding number grows, in percent of it and by at least
 /// 1, for each other thread searching below it (`crowd`): at 8 threads, 1
 /// proved 1.31 times as fast as 10.
 const SPREAD: u64 = 1;
+
 /// Together: the nodes a thread searches after reading what the others found
 /// of a position's children before it reads them again (`refresh`). A short
 /// search leaves the others little time to find anything, and a child the
@@ -165,26 +121,142 @@ const SPREAD: u64 = 1;
 /// times as fast as a read after every child.
 const REFRESH_AFTER: u64 = 16;
 
-/// What guides the search's starting numbers.
-#[derive(Clone, Copy)]
-pub enum Guide<'a> {
-    None,
-    /// The hand-crafted evaluation, cheap.
-    Hand,
-    /// Atomic-Stockfish's network, better but dearer.
-    Network(&'a Network),
-    /// A provability model, with the network's evaluation among its features
-    /// when there is one.
-    Model(&'a Model, Option<&'a Network>),
+#[cfg(feature = "antichess")]
+pub mod antichess;
+mod atomic;
+
+pub use atomic::Guide;
+
+/// What the search needs of a variant's board: its own board, built for
+/// speed, whose moves fit in 16 bits as `Move` holds them.
+pub trait Board: Clone + Send + Sync {
+    /// The position's Zobrist hash, its 50-move counter left out.
+    fn hash(&self) -> u64;
+    /// The 50-move counter.
+    fn halfmoves(&self) -> u32;
+    fn turn(&self) -> Color;
+    /// The position after a legal move.
+    fn play(&self, m: Move) -> Self;
+    /// The position after a legal move whose child's hash is known.
+    #[inline(always)]
+    fn play_known(&self, m: Move, _hash: u64) -> Self {
+        self.play(m)
+    }
+    /// How many pieces stand on the board.
+    fn pieces(&self) -> u32;
+    /// A legal move in UCI's notation.
+    fn uci(&self, m: Move) -> String;
 }
 
-impl<'a> Guide<'a> {
-    fn network(&self) -> Option<&'a Network> {
-        match *self {
-            Guide::Network(network) | Guide::Model(_, Some(network)) => Some(network),
-            _ => None,
-        }
-    }
+/// What a variant tells the search, as a type parameter of it (`Dfpn`): its
+/// positions, the state each search thread keeps for it, and what the search
+/// asks of it while it searches. Each function that takes the search is
+/// called at one place of `Dfpn::mid` or `Dfpn::solve`, and may read and
+/// change the search as `mid` would there.
+pub trait Variant: Sized + 'static {
+    /// A position as the program reads it, from shakmaty.
+    type Root: shakmaty::Position;
+    /// A position as the search plays it.
+    type Board: Board;
+    /// The 1+ε trick's ε, as its inverse: a child may run until it is this
+    /// share dearer than the second best (`widen`).
+    const EPSILON: u32;
+
+    /// What every thread of a search shares and reads, such as the guide
+    /// and the tablebases.
+    type Shared<'a>: Copy + Send;
+    /// What each thread keeps for the variant as it searches, which a
+    /// helper thread hands back as it ends (`gather`).
+    type State<'a>: Send;
+
+    /// A thread's state, from what the threads share.
+    fn state(shared: Self::Shared<'_>) -> Self::State<'_>;
+
+    /// What the threads share, from a thread's state.
+    fn shared<'a>(state: &Self::State<'a>) -> Self::Shared<'a>;
+
+    /// The search's board of a position.
+    fn board(root: &Self::Root) -> Self::Board;
+
+    /// How a root has ended for `attacker`, if it has.
+    fn status(root: &Self::Root, attacker: Color) -> Status;
+
+    /// Scores a position's moves into `children`, with `remaining` attacker
+    /// moves left, and returns the step its evaluation scaled their
+    /// starting numbers by, which a group opened later reuses.
+    fn children(
+        search: &mut Dfpn<'_, Self>,
+        pos: &Self::Board,
+        attacking: bool,
+        remaining: u32,
+        children: &mut Vec<Child>,
+    ) -> Option<f32>;
+
+    /// After a position's children are scored, `fresh` when the table knew
+    /// nothing of it: what the variant learns from them all at once.
+    fn scored(
+        search: &mut Dfpn<'_, Self>,
+        pos: &Self::Board,
+        attacking: bool,
+        fresh: bool,
+        remaining: u32,
+        children: &mut [Child],
+    );
+
+    /// The value of a position with no legal move.
+    fn no_moves(search: &mut Dfpn<'_, Self>, pos: &Self::Board) -> Value;
+
+    /// Scores the moves a group held into `children`, after the others, as
+    /// `children` would have with this `step`.
+    fn open_group(
+        search: &mut Dfpn<'_, Self>,
+        pos: &Self::Board,
+        remaining: u32,
+        children: &mut Vec<Child>,
+        step: Option<f32>,
+    );
+
+    /// After the defence `children[best]`, which leads to `next`, is proven.
+    fn defence_proven(
+        search: &mut Dfpn<'_, Self>,
+        pos: &Self::Board,
+        next: &Self::Board,
+        best: usize,
+        remaining: u32,
+        children: &mut [Child],
+    );
+
+    /// After the defence `m` refuted the position.
+    fn refuted(search: &mut Dfpn<'_, Self>, pos: &Self::Board, m: Move);
+
+    /// Records a proven position: attacking, through the shortest winning
+    /// move; defending, through every defence.
+    fn record_proof(
+        search: &mut Dfpn<'_, Self>,
+        pos: &Self::Board,
+        hash: u64,
+        children: &[Child],
+        attacking: bool,
+    );
+
+    /// The proof of a won position whose proof is not kept, because it comes
+    /// out the same whenever it is worked out again.
+    fn recomputed(search: &Dfpn<'_, Self>, pos: &Self::Board) -> Option<Proof>;
+
+    /// Whether `m` wins at once, as the table's notes of mates in one say,
+    /// in a position the table notes one for.
+    fn mates_with(search: &Dfpn<'_, Self>, pos: &Self::Board, m: Move) -> bool;
+
+    /// Takes in a helper thread's state once its part of a search together
+    /// ends (`search_together`), into the state of the thread that started
+    /// it: for what the variant counts over every thread.
+    #[inline(always)]
+    fn gather<'a>(_state: &mut Self::State<'a>, _helper: Self::State<'a>) {}
+
+    /// Resets the variant's per-thread search state when `Dfpn::clear` forgets
+    /// the search's tables between solves.
+    #[inline(always)]
+    fn clear(_state: &mut Self::State<'_>) {}
 }
 
 /// Where progress lines go instead of standard error.
@@ -192,7 +264,7 @@ pub type ProgressSink = Box<dyn FnMut(&serde_json::Value)>;
 
 /// What runs with the search after each progress line while it goes on
 /// (`set_progress_hook`).
-pub type ProgressHook<'a> = Box<dyn FnMut(&Dfpn<'_>) + 'a>;
+pub type ProgressHook<'a, V = variant::Atomic> = Box<dyn FnMut(&Dfpn<'_, V>) + 'a>;
 
 /// A search's progress lines: how often, the next one, when the search
 /// started, the time and nodes at the last line, and where they go if not
@@ -221,18 +293,18 @@ struct Level {
 }
 
 /// Positions a search expands near its root, kept at random for labelling.
-pub struct Sampler {
+pub struct Sampler<P = Position> {
     pub max_depth: usize,
     pub min_pieces: usize,
     /// How many to keep of the attacker's positions, and of the defender's.
     pub keep: usize,
     seen: [u64; 2],
     rng: u64,
-    pub kept: [Vec<(Position, usize)>; 2],
+    pub kept: [Vec<(P, usize)>; 2],
 }
 
-impl Sampler {
-    pub fn new(max_depth: usize, min_pieces: usize, keep: usize, seed: u64) -> Sampler {
+impl<P: Board> Sampler<P> {
+    pub fn new(max_depth: usize, min_pieces: usize, keep: usize, seed: u64) -> Sampler<P> {
         Sampler {
             max_depth,
             min_pieces,
@@ -244,8 +316,8 @@ impl Sampler {
     }
 
     /// Reservoir sampling, for each side apart.
-    fn offer(&mut self, pos: &Position, attacking: bool, depth: usize) {
-        if depth > self.max_depth || pos.occupied().count() < self.min_pieces {
+    fn offer(&mut self, pos: &P, attacking: bool, depth: usize) {
+        if depth > self.max_depth || (pos.pieces() as usize) < self.min_pieces {
             return;
         }
         let side = usize::from(attacking);
@@ -265,7 +337,7 @@ impl Sampler {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Numbers {
+pub struct Numbers {
     proof: u32,
     disproof: u32,
 }
@@ -274,6 +346,7 @@ const WON: Numbers = Numbers {
     proof: 0,
     disproof: INFINITY,
 };
+
 const LOST: Numbers = Numbers {
     proof: INFINITY,
     disproof: 0,
@@ -281,7 +354,7 @@ const LOST: Numbers = Numbers {
 
 /// What the search knows about a position on the current line.
 #[derive(Clone, Copy)]
-struct Value {
+pub struct Value {
     numbers: Numbers,
     /// For a refutation: the depth on the line of the earliest repeated
     /// position it relies on, or `ANY_LINE`.
@@ -303,7 +376,7 @@ impl Value {
     }
 }
 
-struct Child {
+pub struct Child {
     m: Move,
     hash: u64,
     counter: u32,
@@ -345,7 +418,9 @@ struct Store {
     /// a defence after which every move lets the king be exploded. The search
     /// spots those whenever it scores the move leading there, and proofs
     /// leave out the explosions for the checkers to find. Once the proofs
-    /// first fill, a mate in one is not kept either (`drop_mates`).
+    /// first fill, a mate in one is not kept either (`drop_mates`), and each
+    /// time they fill after that, they drop every proof of at most
+    /// `proofs::SHORT` moves (`drop_short`).
     proofs: Proofs,
     /// Whether the proofs keep mates in one: until they first fill, when they
     /// drop them so that the search goes on (`drop_mates`).
@@ -363,6 +438,10 @@ struct Store {
     full: AtomicBool,
     /// The nodes searched when the proofs dropped their mates in one.
     mates_dropped: Mutex<Option<u64>>,
+    /// How many times the proofs have dropped their short proofs
+    /// (`drop_short`): once they have, the search and a proof's walk work
+    /// one out again where they need it (`short_proof`).
+    short_drops: AtomicU64,
     /// The root's numbers as the thread that settled it left them.
     settled: Mutex<Option<Numbers>>,
     /// Lets a thread drop the mates in one, or rebuild or drop the table's
@@ -395,11 +474,9 @@ impl Drop for Part<'_> {
 }
 
 /// What a thread that helps a search takes from it: all but its own state.
-#[derive(Clone, Copy)]
-struct Settings<'a> {
+struct Settings<'a, V: Variant> {
     attacker: Color,
-    tablebase: Option<&'a Tablebase>,
-    guide: Guide<'a>,
+    variant: V::Shared<'a>,
     deadline: Instant,
     stop: Option<&'a AtomicBool>,
     limit: u64,
@@ -409,21 +486,19 @@ struct Settings<'a> {
     root_attacking: bool,
 }
 
-pub struct Dfpn<'a> {
+// By hand, as a derive would ask the variant itself to be `Copy`.
+impl<V: Variant> Clone for Settings<'_, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<V: Variant> Copy for Settings<'_, V> {}
+
+pub struct Dfpn<'a, V: Variant = variant::Atomic> {
     attacker: Color,
-    tablebase: Option<&'a Tablebase>,
-    guide: Guide<'a>,
-    /// The network's first layer at each depth of the line, each computed
-    /// from its parent's.
-    frames: Vec<Accumulator>,
-    /// The first layer at each king square, for the network's refreshes.
-    refresh_cache: Option<RefreshCache>,
-    /// A plain move's first layer while the moves are graded.
-    scratch_frame: Box<Accumulator>,
-    scratch_transformed: Box<Transformed>,
-    /// The expanded position's first layer as the dense layers and the model
-    /// read it.
-    transformed: Box<Transformed>,
+    /// What this thread keeps for the variant.
+    var: V::State<'a>,
     /// The table and the proofs, which other threads may share.
     store: Arc<Store>,
     /// Whether other threads search with this one, sharing its store.
@@ -437,19 +512,8 @@ pub struct Dfpn<'a> {
     /// waiting while another thread made one.
     filtering: bool,
     path: Vec<u64>,
-    /// How often each attacker move, by piece and destination, proved a
-    /// position, and how often each defence refuted one.
-    attack_history: Vec<u32>,
-    defense_history: Vec<u32>,
-
     /// Each depth's children, kept between expansions to spare allocations.
     buffers: Vec<Vec<Child>>,
-    /// The legal moves being scored, the expanded position's or its passed
-    /// position's, with their effects and whether the filter may hold their
-    /// children.
-    scratch: Vec<(Move, Effect, bool)>,
-    /// The line of a replay (`simulate`), kept between replays.
-    line: Vec<u64>,
     /// One bit, by hash, for each position on the line that the moves being
     /// scored could repeat (`mark_repetitions`): a clear bit spares
     /// `repeated` its walk back along the line.
@@ -466,7 +530,7 @@ pub struct Dfpn<'a> {
     drop_mates_at: usize,
     /// When and how to print progress lines, if at all.
     progress: Option<Progress>,
-    hook: Option<ProgressHook<'a>>,
+    hook: Option<ProgressHook<'a, V>>,
     /// The root's proof and disproof numbers as the search last combined them.
     root: (u32, u32),
     /// Whether the search keeps its line and its root moves' nodes: while it
@@ -476,7 +540,7 @@ pub struct Dfpn<'a> {
     /// current, from `line_root` (`Level`).
     levels: [Level; LINE],
     line_len: usize,
-    line_root: Option<Position>,
+    line_root: Option<V::Board>,
     /// This thread's nodes below each root move searched.
     root_moves: Vec<(Move, u64)>,
     /// The highest root proof number a progress line has reported.
@@ -497,47 +561,31 @@ pub struct Dfpn<'a> {
     /// The root's proof and disproof numbers when the search last stopped.
     pub root_numbers: Option<(u32, u32)>,
     /// Expanded positions kept for labelling, when sampling.
-    pub sampler: Option<Sampler>,
+    pub sampler: Option<Sampler<V::Board>>,
     /// Whether to keep the features of the next expanded position, once.
     pub record: bool,
     pub recorded: Option<[f32; FEATURES]>,
+    /// For tests: whether each short proof found is checked against the
+    /// search that works one out again (`check_short`), and how many were.
+    #[cfg(test)]
+    checking: bool,
+    #[cfg(test)]
+    checked: u64,
 }
 
-impl<'a> Dfpn<'a> {
-    /// A search of `root` with a table and proofs of these megabytes.
-    pub fn new(
-        root: &Atomic,
-        tablebase: Option<&'a Tablebase>,
-        guide: Guide<'a>,
-        deadline: Instant,
-        memory: (usize, usize),
-    ) -> Dfpn<'a> {
-        Dfpn::try_new(root, tablebase, guide, deadline, memory)
-            .unwrap_or_else(|error| panic!("the search's memory: {error}"))
-    }
-
-    /// As `new`, unless the memory cannot be had, as a browser may refuse it.
-    pub fn try_new(
-        root: &Atomic,
-        tablebase: Option<&'a Tablebase>,
-        guide: Guide<'a>,
-        deadline: Instant,
-        memory: (usize, usize),
-    ) -> Result<Dfpn<'a>, TryReserveError> {
-        Dfpn::try_with_threads(root, tablebase, guide, deadline, memory, 1)
-    }
-
-    /// As `try_new`, for `threads` threads that search together, sharing the
+impl<'a, V: Variant> Dfpn<'a, V> {
+    /// A search for `attacker`'s wins, with a table and proofs of these
+    /// megabytes, for `threads` threads that search together, sharing the
     /// table and the proofs: this search is one of them, and starts the
-    /// others for each `solve`, each with a seed of its own.
-    pub fn try_with_threads(
-        root: &Atomic,
-        tablebase: Option<&'a Tablebase>,
-        guide: Guide<'a>,
+    /// others for each `solve`, each with a seed of its own. Unless the
+    /// memory cannot be had, as a browser may refuse it.
+    fn with_threads(
+        attacker: Color,
+        variant: V::Shared<'a>,
         deadline: Instant,
         (table_mb, proofs_mb): (usize, usize),
         threads: usize,
-    ) -> Result<Dfpn<'a>, TryReserveError> {
+    ) -> Result<Dfpn<'a, V>, TryReserveError> {
         let threads = threads.max(1);
         let shared = threads > 1;
         let store = Store {
@@ -549,14 +597,14 @@ impl<'a> Dfpn<'a> {
             stop: AtomicBool::new(false),
             full: AtomicBool::new(false),
             mates_dropped: Mutex::new(None),
+            short_drops: AtomicU64::new(0),
             settled: Mutex::new(None),
             pause: Pause::new(),
             busy: if shared { busy_slots()? } else { Vec::new() },
         };
         let settings = Settings {
-            attacker: shakmaty::Position::turn(root),
-            tablebase,
-            guide,
+            attacker,
+            variant,
             deadline,
             stop: None,
             limit: u64::MAX,
@@ -570,28 +618,17 @@ impl<'a> Dfpn<'a> {
 
     /// A search with these settings and a state of its own, which keeps what
     /// it learns in `store`.
-    fn with_store(store: Arc<Store>, settings: Settings<'a>) -> Dfpn<'a> {
+    fn with_store(store: Arc<Store>, settings: Settings<'a, V>) -> Dfpn<'a, V> {
         Dfpn {
             attacker: settings.attacker,
-            tablebase: settings.tablebase,
-            guide: settings.guide,
-            frames: Vec::new(),
-            refresh_cache: None,
-            scratch_frame: Box::default(),
-            scratch_transformed: Box::default(),
-            transformed: Box::default(),
+            var: V::state(settings.variant),
             together: store.threads > 1,
             filtering: store.table.filtering(),
             store,
             flushed: 0,
             puts: 0,
             path: Vec::new(),
-            attack_history: vec![0; 7 * 64],
-            defense_history: vec![0; 7 * 64],
-
             buffers: Vec::new(),
-            scratch: Vec::new(),
-            line: Vec::new(),
             repetitions: [0; 16],
             deadline: settings.deadline,
             stop: settings.stop,
@@ -618,15 +655,18 @@ impl<'a> Dfpn<'a> {
             sampler: None,
             record: false,
             recorded: None,
+            #[cfg(test)]
+            checking: false,
+            #[cfg(test)]
+            checked: 0,
         }
     }
 
     /// What a thread that helps this search takes from it.
-    fn settings(&self) -> Settings<'a> {
+    fn settings(&self) -> Settings<'a, V> {
         Settings {
             attacker: self.attacker,
-            tablebase: self.tablebase,
-            guide: self.guide,
+            variant: V::shared(&self.var),
             deadline: self.deadline,
             stop: self.stop,
             limit: self.limit,
@@ -704,7 +744,7 @@ impl<'a> Dfpn<'a> {
     /// Runs `hook` with the search after each progress line, unless the
     /// search has stopped: for what reads its proofs while it goes on, as
     /// the browser build writes a shorter win's proof for its page.
-    pub fn set_progress_hook(&mut self, hook: ProgressHook<'a>) {
+    pub fn set_progress_hook(&mut self, hook: ProgressHook<'a, V>) {
         self.hook = Some(hook);
     }
 
@@ -715,16 +755,16 @@ impl<'a> Dfpn<'a> {
     }
 
     /// How many attacker moves the proven win takes, if one is found in time.
-    pub fn solve(&mut self, root: &Atomic) -> Option<u32> {
+    pub fn solve(&mut self, root: &V::Root) -> Option<u32> {
         self.line_len = 0;
         self.root_moves.clear();
         self.peak = 0;
         // The search settles a position that has ended before reaching it;
         // a root that has ended, such as a sampled defender position, is
         // settled here, for the attacker as set.
-        match status(root, self.attacker) {
+        match V::status(root, self.attacker) {
             Status::Won => {
-                self.add_proof(Position::from_atomic(root).hash(), Proof::FINISHED);
+                self.add_proof(V::board(root).hash(), Proof::FINISHED);
                 self.root_numbers = Some((0, INFINITY));
                 return Some(0);
             }
@@ -735,7 +775,7 @@ impl<'a> Dfpn<'a> {
             Status::Open => {}
         }
         self.root_attacking = shakmaty::Position::turn(root) == self.attacker;
-        let root = Position::from_atomic(root);
+        let root = V::board(root);
         self.line_root = Some(root.clone());
         let numbers = if self.together {
             self.search_together(&root)
@@ -748,7 +788,7 @@ impl<'a> Dfpn<'a> {
             return None;
         }
         self.proof_at(root.hash(), root.halfmoves())
-            .or_else(|| self.recomputed(&root))
+            .or_else(|| V::recomputed(self, &root))
             .map(|proof| proof.length)
     }
 
@@ -756,7 +796,7 @@ impl<'a> Dfpn<'a> {
     /// or they stop: this thread with its own seed, each other with another.
     /// Returns the root's numbers as the thread that settled it left them,
     /// else as this one did.
-    fn search_together(&mut self, root: &Position) -> Numbers {
+    fn search_together(&mut self, root: &V::Board) -> Numbers {
         let store = Arc::clone(&self.store);
         store.nodes.store(self.nodes, Relaxed);
         store.stop.store(false, Relaxed);
@@ -776,7 +816,8 @@ impl<'a> Dfpn<'a> {
                     let _part = part;
                     let mut search = Dfpn::with_store(shared, settings);
                     search.seed = seed.wrapping_add(SEED_SPREAD.wrapping_mul(thread as u64));
-                    search.search_root(root)
+                    let numbers = search.search_root(root);
+                    (numbers, search.var)
                 });
                 helpers.extend(started.ok());
             }
@@ -788,8 +829,9 @@ impl<'a> Dfpn<'a> {
             // work, and a thread joined has exited too, which the browser
             // build's next spawn may wait for (web/worker.js).
             for helper in helpers {
-                if let Err(panic) = helper.join() {
-                    std::panic::resume_unwind(panic);
+                match helper.join() {
+                    Ok((_, state)) => V::gather(&mut self.var, state),
+                    Err(panic) => std::panic::resume_unwind(panic),
                 }
             }
             numbers
@@ -808,7 +850,7 @@ impl<'a> Dfpn<'a> {
 
     /// One thread's search of the root among others: once it settles the
     /// root, they stop.
-    fn search_root(&mut self, root: &Position) -> Numbers {
+    fn search_root(&mut self, root: &V::Board) -> Numbers {
         let numbers = self.mid(root, INFINITY, INFINITY).numbers;
         self.flush();
         if numbers.proof == 0 || numbers.disproof == 0 {
@@ -838,7 +880,7 @@ impl<'a> Dfpn<'a> {
     /// shorter win exists.
     pub fn shorten(
         &mut self,
-        root: &Atomic,
+        root: &V::Root,
         mut length: u32,
         mut improved: impl FnMut(&Self, u32),
     ) -> Shortening {
@@ -871,25 +913,51 @@ impl<'a> Dfpn<'a> {
         }
     }
 
-    /// The winning move for an attacker position, for reading the proof back:
-    /// once the proofs have dropped their mates in one, a mate in one found
-    /// again.
-    pub fn winning_move(&self, pos: &Atomic, key: &Key) -> Option<shakmaty::Move> {
-        let pos = Position::from_atomic(pos);
-        let m = match self.proof_at(key.0, key.1) {
-            Some(proof) => proof.m?,
-            None => self.dropped_mate(&pos)?,
-        };
-        Some(pos.to_shakmaty(m))
+    /// A position's kept proof for a walk at this counter: the shortest that
+    /// holds there, or with `furthest` the one that holds at the highest
+    /// counter. A position proven at a low counter and again, by a longer
+    /// proof with another move, at a higher one keeps both, and a walk that
+    /// meets it at both counters writes both moves when it takes the shortest
+    /// each time: every line it walks then shrinks, but the two moves of one
+    /// position with the two of another can link them in a circle, which the
+    /// format forbids, as it compares positions without their counters
+    /// (FORMAT.md). The proof that holds furthest is the same at every
+    /// counter, so a walk that takes it writes one move a position; and the
+    /// positions its defences reach hold further still, or come after a
+    /// capture or pawn move, so its lines end.
+    fn kept_proof(&self, hash: u64, counter: u32, furthest: bool) -> Option<Proof> {
+        let mut proof = self.proof_at(hash, counter)?;
+        while furthest
+            && proof.limit < LAST
+            && let Some(further) = self.proofs().get(hash, proof.limit + 1)
+        {
+            proof = further;
+        }
+        Some(proof)
     }
 
-    /// `winning_move` on the board a proof's walk plays (`format::walk`),
-    /// with no position or move to convert.
-    pub fn proof_move(&self, pos: &Position) -> Option<Move> {
-        match self.proof_at(pos.hash(), pos.halfmoves()) {
-            Some(proof) => proof.m,
-            None => self.dropped_mate(pos),
-        }
+    /// Forgets everything the search has learned, its table and its proofs,
+    /// so that the next `solve` starts afresh: between solves, when no other
+    /// thread shares the store.
+    pub fn clear(&mut self) {
+        let store = Arc::get_mut(&mut self.store).expect("no thread searches between solves");
+        store.table.clear();
+        store.proofs.clear();
+        *store.mates_kept.get_mut() = true;
+        *store.full.get_mut() = false;
+        *store.short_drops.get_mut() = 0;
+        *lock(&store.mates_dropped) = None;
+        self.filtering = store.table.filtering();
+        self.full = false;
+        self.stopped = false;
+        self.mates_dropped = None;
+        self.root_numbers = None;
+        V::clear(&mut self.var);
+    }
+
+    /// The proofs kept, and the most the proofs' memory takes.
+    pub fn proofs_kept(&self) -> (usize, usize) {
+        (self.proofs().taken(), self.proofs().room())
     }
 
     /// Has the proofs drop their mates in one once they hold this share of
@@ -906,7 +974,13 @@ impl<'a> Dfpn<'a> {
         self.full
     }
 
-    fn mid(&mut self, pos: &Position, proof_limit: u32, disproof_limit: u32) -> Value {
+    /// How many times the proofs have dropped their short proofs
+    /// (`drop_short`).
+    pub fn short_drops(&self) -> u64 {
+        self.store.short_drops.load(Relaxed)
+    }
+
+    fn mid(&mut self, pos: &V::Board, proof_limit: u32, disproof_limit: u32) -> Value {
         let start = self.nodes;
         let hash = pos.hash();
         let counter = pos.halfmoves();
@@ -916,12 +990,14 @@ impl<'a> Dfpn<'a> {
         if self.proof_within(hash, counter, remaining).is_some() {
             return Value::WON;
         }
-        // Out of attacker moves, a game that goes on is lost to the limit.
-        if remaining == 0 {
+        // Out of attacker moves, the attacker to move has lost to the limit.
+        // The defender to move may still lose at once, as an Antichess
+        // defence can; Atomic's are settled where they are scored.
+        if remaining == 0 && pos.turn() == self.attacker {
             return Value::DRAWN;
         }
         let key = self.key(hash, remaining);
-        let known = self.lookup(key, counter, |m| self.mates_with(pos, m));
+        let known = self.lookup(key, counter, |m| V::mates_with(self, pos, m));
         // A mate in one the table notes comes back won, its disproof number
         // past every limit.
         if let Some(value) = known {
@@ -940,22 +1016,21 @@ impl<'a> Dfpn<'a> {
             self.buffers.resize_with(level + 1, Vec::new);
         }
         let mut children = std::mem::take(&mut self.buffers[level]);
-        let step = self.children(pos, attacking, remaining, &mut children);
-        if !attacking && known.is_none() && !children.is_empty() && !pos.in_check() {
-            self.replay_threat(pos, remaining, &mut children);
-        }
+        let step = V::children(self, pos, attacking, remaining, &mut children);
+        V::scored(
+            self,
+            pos,
+            attacking,
+            known.is_none(),
+            remaining,
+            &mut children,
+        );
         if let Some(sampler) = &mut self.sampler {
             sampler.offer(pos, attacking, self.path.len());
         }
         if children.is_empty() {
             self.buffers[level] = children;
-            // A mate is settled before the search reaches it, except at the
-            // root; anything else is a stalemate, a draw.
-            let value = if pos.in_check() {
-                self.mated(pos).unwrap_or(Value::DRAWN)
-            } else {
-                Value::DRAWN
-            };
+            let value = V::no_moves(self, pos);
             return self.settle(key, counter, value, 1);
         }
         let depth = self.path.len() as u32;
@@ -987,26 +1062,26 @@ impl<'a> Dfpn<'a> {
                 children.swap_remove(best);
                 opened = Some(children.len());
                 self.path.pop();
-                self.open_group(pos, remaining, &mut children, step);
+                V::open_group(self, pos, remaining, &mut children, step);
                 self.path.push(hash);
                 continue;
             }
             let current = children[best].value.numbers;
             let (child_proof, child_disproof) = if attacking {
                 (
-                    proof_limit.min(widen(second)),
+                    proof_limit.min(widen(second, V::EPSILON)),
                     share(disproof_limit, numbers.disproof, current.disproof),
                 )
             } else {
                 (
                     share(proof_limit, numbers.proof, current.proof),
-                    disproof_limit.min(widen(second)),
+                    disproof_limit.min(widen(second, V::EPSILON)),
                 )
             };
             if self.keeping && (depth as usize) < LINE {
                 self.keep_level(depth as usize, attacking, &children, best);
             }
-            let next = pos.play(children[best].m);
+            let next = pos.play_known(children[best].m, children[best].hash);
             debug_assert_eq!(next.hash(), children[best].hash);
             // Together, the other threads see this one below the child while
             // it searches there.
@@ -1023,30 +1098,8 @@ impl<'a> Dfpn<'a> {
                 self.searched(children[best].m, self.nodes - before);
             }
             children[best].value = value;
-            // A defence just proven may prove its siblings too: replay its
-            // proof on each defence still open.
             if !attacking && value.numbers.proof == 0 {
-                for (index, sibling) in children.iter_mut().enumerate() {
-                    let open =
-                        sibling.value.numbers.proof != 0 && sibling.value.numbers.disproof != 0;
-                    if index == best || sibling.simulated || !open {
-                        continue;
-                    }
-                    sibling.simulated = true;
-                    let position = pos.play(sibling.m);
-                    let mut left = SIMULATION;
-                    let mut line = std::mem::take(&mut self.line);
-                    let reached = self.simulate(&position, &next, remaining, &mut left, &mut line);
-                    self.line = line;
-                    if reached.is_some_and(|(length, _)| length <= remaining) {
-                        debug_assert!(
-                            self.full
-                                || self.proof_at(sibling.hash, sibling.counter).is_some()
-                                || self.recomputed(&position).is_some()
-                        );
-                        sibling.value = Value::WON;
-                    }
-                }
+                V::defence_proven(self, pos, &next, best, remaining, &mut children);
             }
             if self.together && !self.stopped && self.nodes - read >= REFRESH_AFTER {
                 read = self.nodes;
@@ -1055,8 +1108,7 @@ impl<'a> Dfpn<'a> {
         };
         self.path.pop();
         if !attacking && value.numbers.disproof == 0 {
-            let index = history_index(pos, children[best].m);
-            self.defense_history[index] = self.defense_history[index].saturating_add(1);
+            V::refuted(self, pos, children[best].m);
         }
         // Repeating this position, or one after it, refutes it on any line.
         let value = if value.cycle >= depth {
@@ -1095,11 +1147,11 @@ impl<'a> Dfpn<'a> {
             }
         }
         if value.numbers.proof == 0 {
-            self.record_proof(pos, hash, &children, attacking);
+            V::record_proof(self, pos, hash, &children, attacking);
             debug_assert!(
                 self.full
                     || self.proof_at(hash, counter).is_some()
-                    || self.recomputed(pos).is_some(),
+                    || V::recomputed(self, pos).is_some(),
                 "a win without a proof"
             );
         } else if !self.stopped {
@@ -1112,7 +1164,7 @@ impl<'a> Dfpn<'a> {
     /// Together: what the store now knows of the open children, which other
     /// threads may have searched since this one looked, as `mid` would find
     /// it on reaching each, with this position on the line.
-    fn refresh(&self, pos: &Position, children: &mut [Child]) {
+    fn refresh(&self, pos: &V::Board, children: &mut [Child]) {
         let remaining = self.remaining(self.path.len());
         let filtering = self.filtering;
         let open =
@@ -1144,7 +1196,7 @@ impl<'a> Dfpn<'a> {
             } else {
                 let key = self.key(child.hash, remaining);
                 self.lookup(key, child.counter, |mate| {
-                    self.mates_with(&pos.play(child.m), mate)
+                    V::mates_with(self, &pos.play(child.m), mate)
                 })
             };
             if let Some(value) = known {
@@ -1163,592 +1215,6 @@ impl<'a> Dfpn<'a> {
         }
         let busy = self.store.busy[busy_slot(child.hash)].load(Relaxed);
         crowd(deciding, busy)
-    }
-
-    /// Scores a position's moves into `children`, with `remaining` attacker
-    /// moves left, and returns the step its evaluation scaled their starting
-    /// numbers by.
-    fn children(
-        &mut self,
-        pos: &Position,
-        attacking: bool,
-        remaining: u32,
-        children: &mut Vec<Child>,
-    ) -> Option<f32> {
-        let candidates = pos.pseudo_legal();
-        let mover = Mover::new(pos);
-        // The attacker's plain moves wait together, except where a pawn move
-        // could reach the tablebases.
-        let group = attacking
-            && self
-                .tablebase
-                .is_none_or(|tables| pos.occupied().count() > tables.max_pieces() + 1);
-        let mut plain = 0;
-        let left = remaining.saturating_sub(u32::from(attacking));
-        if attacking && left == 0 && !self.record {
-            self.last_children(pos, &mover, children);
-            return None;
-        }
-        // First every legal move's effect and its child's bit in the filter,
-        // starting the table reads of the children it may hold: the reads do
-        // not wait on one another, so their latencies overlap.
-        let mut legal = std::mem::take(&mut self.scratch);
-        legal.clear();
-        let filtering = self.filtering;
-        for &m in candidates.as_slice() {
-            if group && mover.plain(m) {
-                plain += u32::from(mover.legal(m));
-                continue;
-            }
-            if mover.legal(m) {
-                let effect = mover.full_effect(m);
-                self.prefetch_child(effect.hash, left, filtering);
-                legal.push((m, effect, !filtering));
-            }
-        }
-        // Then the filter's bits, their loads under way, and the table reads
-        // of the children it may hold.
-        if filtering {
-            self.read_filter(&mut legal, left);
-        }
-        children.clear();
-        self.mark_repetitions(pos.halfmoves());
-        for &(m, effect, seen) in &legal {
-            children.push(self.evaluate(pos, &mover, m, &effect, seen, attacking, left, EVASIONS));
-        }
-        self.scratch = legal;
-        if plain > 0 {
-            let key = self.key(pos.hash(), remaining) ^ GROUP;
-            let counter = pos.halfmoves();
-            let known = self
-                .lookup(key, counter, |_| false)
-                .filter(|value| value.numbers.disproof != 0);
-            children.push(Child {
-                m: Move::default(),
-                hash: key,
-                counter,
-                value: known.unwrap_or(Value::open(Numbers {
-                    proof: QUIET,
-                    disproof: plain,
-                })),
-                exploded: false,
-                winning: false,
-                score: 0,
-                simulated: false,
-                fresh: known.is_none(),
-                group: true,
-            });
-        }
-        let step = self.step(pos, attacking, children, plain);
-        scale(children, attacking, step);
-        step
-    }
-
-    /// `children` for an attacker position with one move left, where only a
-    /// move that wins at once counts: a plain move neither captures nor
-    /// checks, so it cannot and is left out, unless a pawn move may reach a
-    /// tablebase win; every other child is decided where it is scored, so
-    /// nothing needs the position's evaluation. Apart from `children`, so
-    /// that searches without a limit run the same code.
-    #[inline(never)]
-    fn last_children(&mut self, pos: &Position, mover: &Mover, children: &mut Vec<Child>) {
-        let mut legal = std::mem::take(&mut self.scratch);
-        legal.clear();
-        let filtering = self.filtering;
-        let tables = !self.exact
-            && self
-                .tablebase
-                .is_some_and(|tables| pos.occupied().count() <= tables.max_pieces());
-        for &m in pos.pseudo_legal().as_slice() {
-            let kept =
-                !mover.plain(m) || tables && pos.role_at(m.from()) == Some(shakmaty::Role::Pawn);
-            if !kept || !mover.legal(m) {
-                continue;
-            }
-            let effect = mover.full_effect(m);
-            self.prefetch_child(effect.hash, 0, filtering);
-            legal.push((m, effect, !filtering));
-        }
-        if filtering {
-            self.read_filter(&mut legal, 0);
-        }
-        children.clear();
-        self.mark_repetitions(pos.halfmoves());
-        for &(m, effect, seen) in &legal {
-            children.push(self.evaluate(pos, mover, m, &effect, seen, true, 0, EVASIONS));
-        }
-        self.scratch = legal;
-    }
-
-    /// The expanded position's evaluation for the attacker, squashed to a
-    /// step from 0, the defender clearly ahead, to 2, the attacker clearly
-    /// ahead, when an evaluation guides the search.
-    fn step(
-        &mut self,
-        pos: &Position,
-        attacking: bool,
-        children: &[Child],
-        plain: u32,
-    ) -> Option<f32> {
-        let value = self
-            .guide
-            .network()
-            .map(|network| self.network_value(network, pos));
-        if self.record {
-            // The first position expanded: the root.
-            self.recorded = Some(self.features(pos, attacking, children, plain, value));
-            self.record = false;
-        }
-        let step = match self.guide {
-            Guide::None => None,
-            Guide::Hand => {
-                let value = crate::eval::evaluate(pos);
-                Some(self.band(pos, value, HAND_DECISIVE))
-            }
-            Guide::Network(_) => value.map(|value| self.band(pos, value, DECISIVE)),
-            Guide::Model(model, network) => {
-                let features = self.features(pos, attacking, children, plain, value);
-                // The position's first layer, which `network_value` just
-                // transformed.
-                let layer = network
-                    .filter(|_| model.reads_layer())
-                    .map(|_| &*self.transformed);
-                let logit = |chance: f32| {
-                    let chance = chance.clamp(1e-6, 1.0 - 1e-6);
-                    (chance / (1.0 - chance)).ln()
-                };
-                // Centred on the share proven among the model's own positions,
-                // so that an average position takes the middle step.
-                let chance = model.predict(attacking, &features, layer);
-                let centred = logit(chance) - logit(model.prior(attacking));
-                Some(2.0 / (1.0 + (-centred).exp()))
-            }
-        };
-        step.map(|step| self.perturb(pos, step))
-    }
-
-    /// The step moved by up to 1% either way when a seed is set, by a hash of
-    /// the position and the seed, so that every expansion of a position
-    /// agrees. A model's step moves through its odds: moved itself, it could
-    /// pass 2, where `scale` switches to EF-PN's formula.
-    fn perturb(&self, pos: &Position, step: f32) -> f32 {
-        if self.seed == 0 {
-            return step;
-        }
-        let mixed = (pos.hash() ^ self.seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let unit = (mixed >> 40) as f32 / (1 << 23) as f32 - 1.0;
-        if matches!(self.guide, Guide::Model(..)) {
-            perturb_model_step(step, unit)
-        } else {
-            step * (1.0 + 0.01 * unit)
-        }
-    }
-
-    /// The network's evaluation for the side to move, with its first layer
-    /// transformed into `transformed`, where the model reads it. The line's
-    /// first layers follow the search down: this depth's from its parent's,
-    /// which the parent computed when it expanded.
-    fn network_value(&mut self, network: &Network, pos: &Position) -> i32 {
-        let level = self.path.len();
-        if self.frames.len() <= level {
-            self.frames.resize_with(level + 1, Accumulator::default);
-        }
-        let (parents, frames) = self.frames.split_at_mut(level);
-        let frame = &mut frames[0];
-        match parents.last() {
-            Some(parent) => {
-                let cache = self
-                    .refresh_cache
-                    .get_or_insert_with(|| RefreshCache::new(network));
-                network.update(parent, pos, frame, cache);
-            }
-            None => network.refresh(pos, frame),
-        }
-        network.transform(frame, pos, &mut self.transformed);
-        network.output_from(&self.transformed, frame, pos)
-    }
-
-    /// A position's features for the provability model, from the attacker's
-    /// side, given its children's starting numbers before any scaling and
-    /// the network's evaluation for the side to move, if any.
-    fn features(
-        &self,
-        pos: &Position,
-        attacking: bool,
-        children: &[Child],
-        plain: u32,
-        value: Option<i32>,
-    ) -> [f32; FEATURES] {
-        let for_attacker = |value: i32| if attacking { value } else { -value };
-        let clip = |value: f32| value.clamp(-3.0, 3.0);
-        let net = value.map(for_attacker);
-        let material =
-            crate::eval::material(pos, self.attacker) - crate::eval::material(pos, !self.attacker);
-        let kings_touch = match (pos.king(self.attacker), pos.king(!self.attacker)) {
-            (Some(ours), Some(theirs)) => shakmaty::attacks::king_attacks(ours).contains(theirs),
-            _ => false,
-        };
-        // One pass over the children: those open, the moves, and among the
-        // fresh moves the forcing, the strong, the cheapest and the good.
-        let (mut open, mut moves, mut losing) = (0, plain as usize, 0);
-        let (mut forcing, mut strong, mut good, mut cheapest) = (0, 0, 0, None::<u32>);
-        for child in children.iter() {
-            let numbers = child.value.numbers;
-            open += usize::from(numbers.proof != 0 && numbers.disproof != 0);
-            losing += usize::from(child.winning);
-            if child.group {
-                continue;
-            }
-            moves += 1;
-            if child.fresh {
-                forcing += usize::from(numbers.proof <= 8);
-                strong += usize::from(numbers.proof == 1);
-                good += usize::from(numbers.disproof == 1);
-                cheapest = Some(cheapest.map_or(numbers.proof, |known| known.min(numbers.proof)));
-            }
-        }
-        let (forcing, strong, cheapest, good, losing) = if attacking {
-            (forcing, strong, cheapest.unwrap_or(QUIET), 0, 0.0)
-        } else {
-            (
-                0,
-                0,
-                QUIET,
-                good,
-                losing as f32 / children.len().max(1) as f32,
-            )
-        };
-        let ln = |count: usize| (1.0 + count as f32).ln();
-        [
-            net.map_or(0.0, |net| clip(net as f32 / 2080.0)),
-            net.map_or(0.0, |net| f32::from(net >= DECISIVE)),
-            net.map_or(0.0, |net| f32::from(net <= -DECISIVE)),
-            clip(material as f32 / 3000.0),
-            pos.occupied().count() as f32 / 32.0,
-            f32::from(kings_touch),
-            f32::from(pos.in_check()),
-            ln(moves) / 4.0,
-            ln(forcing) / 3.0,
-            strong.min(4) as f32 / 4.0,
-            if cheapest >= QUIET {
-                1.0
-            } else {
-                cheapest as f32 / FITTED_QUIET
-            },
-            if attacking { 0.0 } else { ln(open) / 3.0 },
-            ln(good) / 3.0,
-            losing,
-            pos.halfmoves() as f32 / 100.0,
-        ]
-    }
-
-    /// An evaluation for the side to move, squashed for the attacker to 0
-    /// when the defender is clearly ahead, 1 when neither is, or 2.
-    fn band(&self, pos: &Position, value: i32, decisive: i32) -> f32 {
-        let value = if pos.turn() == self.attacker {
-            value
-        } else {
-            -value
-        };
-        if value >= decisive {
-            2.0
-        } else if value <= -decisive {
-            0.0
-        } else {
-            1.0
-        }
-    }
-
-    /// Scores the plain moves a group held, as `children` would have.
-    fn open_group(
-        &mut self,
-        pos: &Position,
-        remaining: u32,
-        children: &mut Vec<Child>,
-        step: Option<f32>,
-    ) {
-        let first = children.len();
-        let mover = Mover::new(pos);
-        let left = remaining.saturating_sub(1);
-        // The moves first, their filter words' loads started, as in `children`.
-        let mut plain = std::mem::take(&mut self.scratch);
-        plain.clear();
-        let filtering = self.filtering;
-        for &m in pos.pseudo_legal().as_slice() {
-            if mover.plain(m) && mover.legal(m) {
-                let effect = mover.full_effect(m);
-                self.prefetch_child(effect.hash, left, filtering);
-                plain.push((m, effect, !filtering));
-            }
-        }
-        if filtering {
-            self.read_filter(&mut plain, left);
-        }
-        self.mark_repetitions(pos.halfmoves());
-        for &(m, effect, seen) in &plain {
-            children.push(self.evaluate(pos, &mover, m, &effect, seen, true, left, EVASIONS));
-        }
-        self.scratch = plain;
-        scale(&mut children[first..], true, step);
-        self.grade(pos, &mut children[first..]);
-    }
-
-    /// Raises the starting numbers of the plain moves the network likes less
-    /// than its best `GRADED`, by its evaluation after each.
-    fn grade(&mut self, pos: &Position, plain: &mut [Child]) {
-        let Some(network) = self.guide.network() else {
-            return;
-        };
-        // The expanded position's first layer, which `network_value` computed
-        // when this visit expanded it.
-        let level = self.path.len();
-        if self.frames.len() <= level || plain.len() <= GRADED {
-            return;
-        }
-        let pieces = pos.occupied().count() as u32;
-        // The best GRADED values and their moves, earlier moves first among
-        // equal values.
-        let mut best: [Option<(i32, usize)>; GRADED] = [None; GRADED];
-        for (index, child) in plain.iter().enumerate() {
-            if !child.fresh {
-                continue;
-            }
-            // A plain move is quiet and not a king's: its first layer follows
-            // from the expanded position's without building the position.
-            let (m, them) = (child.m, !pos.turn());
-            network.update_quiet(
-                &self.frames[level],
-                m.from(),
-                m.to(),
-                &mut self.scratch_frame,
-            );
-            network.transform_for(&self.scratch_frame, them, &mut self.scratch_transformed);
-            // The defender moves next: the attacker's view is the negation.
-            let value =
-                -network.output_for(&self.scratch_transformed, &self.scratch_frame, pieces, them);
-            debug_assert_eq!(value, -network.evaluate(&pos.play(m)));
-            // Moves come in order, so only a higher value displaces a kept
-            // one.
-            if let Some(place) = best
-                .iter()
-                .position(|kept| kept.is_none_or(|(kept, _)| value > kept))
-            {
-                best.copy_within(place..GRADED - 1, place + 1);
-                best[place] = Some((value, index));
-            }
-        }
-        for (index, child) in plain.iter_mut().enumerate() {
-            if child.fresh && !best.iter().flatten().any(|&(_, kept)| kept == index) {
-                let numbers = &mut child.value.numbers;
-                numbers.proof = (numbers.proof * UNGRADED).min(1 << 24);
-            }
-        }
-    }
-
-    /// What is known about a child before searching it, from its move's
-    /// effect, with `remaining` attacker moves left there; the child position
-    /// is built only for a check, a tablebase probe, or en passant.
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate(
-        &mut self,
-        pos: &Position,
-        mover: &Mover,
-        m: Move,
-        effect: &Effect,
-        seen: bool,
-        attacking: bool,
-        remaining: u32,
-        evasions: u32,
-    ) -> Child {
-        let counter = effect.counter;
-        let hash = effect.hash;
-        let key = self.key(hash, remaining);
-        let history = if attacking {
-            &self.attack_history
-        } else {
-            &self.defense_history
-        };
-        let score = history[history_index(pos, m)];
-        let child = |value: Value, exploded: bool| Child {
-            m,
-            hash,
-            counter,
-            value,
-            exploded,
-            winning: false,
-            score,
-            simulated: false,
-            fresh: false,
-            group: false,
-        };
-        // Only a capture explodes a king, never the mover's.
-        if mover.explodes_them(effect) {
-            return if attacking {
-                child(Value::WON, true)
-            } else {
-                child(Value::DRAWN, false)
-            };
-        }
-        // A move after which the defender explodes the attacker's king at
-        // once loses on any line.
-        if attacking && mover.exposes(m, effect) {
-            return child(Value::DRAWN, false);
-        }
-        if let Some(depth) = self.repeated(hash, counter) {
-            let repeated = Value {
-                cycle: depth,
-                ..Value::DRAWN
-            };
-            return child(repeated, false);
-        }
-        // A defence after which the attacker explodes the defender's king at
-        // once is won without a search, as a mate in one is, unless it
-        // reaches the 50-move limit.
-        if !attacking && counter <= LAST && mover.exposes(m, effect) {
-            return Child {
-                winning: true,
-                ..child(Value::WON, false)
-            };
-        }
-        // Most children are new: one bit of the filter says so for both tables.
-        if seen && self.proof_within(hash, counter, remaining).is_some() {
-            return child(Value::WON, false);
-        }
-        // The tables decide a child reached by a capture or pawn move, with
-        // any moves left.
-        if counter == 0
-            && self.tablebase.is_some()
-            && let Some(value) = self.tablebase_value(pos, m, effect, key, seen)
-        {
-            return child(value, false);
-        }
-        // Out of attacker moves, only a mate still wins.
-        if remaining == 0 {
-            let mated = mover.gives_check(m, effect)
-                && self
-                    .mated(&pos.play(m))
-                    .is_some_and(|value| value.numbers.proof == 0);
-            return child(if mated { Value::WON } else { Value::DRAWN }, false);
-        }
-        let check = mover.gives_check(m, effect);
-        if counter > LAST {
-            // Past the 50-move limit only a mate still counts.
-            let value = match check.then(|| self.mated(&pos.play(m))).flatten() {
-                Some(value) => self.settle(key, counter, value, 0),
-                None => Value {
-                    fifty: true,
-                    ..Value::DRAWN
-                },
-            };
-            return child(value, false);
-        }
-        // A mate in one the table notes is checked on the child's position,
-        // made only then.
-        let known = if seen {
-            self.lookup(key, counter, |mate| self.mates_with(&pos.play(m), mate))
-        } else {
-            None
-        };
-        if let Some(value) = known {
-            return child(value, false);
-        }
-        // Met for the first time: settle mates and positions the attacker
-        // cannot win, and otherwise start from how forcing the move was.
-        let mut check_proof = 1;
-        if check {
-            let next = pos.play(m);
-            if attacking {
-                // A check is as hard to prove as it has evasions that
-                // survive, and with none it wins in two moves; with no
-                // evasion at all it mates.
-                let (any, safe) = moves::replies(&next, evasions);
-                if !any || safe == 0 && self.exposed(&next).is_some() {
-                    return child(Value::WON, false);
-                }
-                check_proof = safe.max(1);
-            } else if let Some(value) = self.mated(&next) {
-                return child(self.settle(key, counter, value, 0), false);
-            }
-        }
-        // Only a capture or a promotion changes the material.
-        if (effect.capture || m.promotion().is_some())
-            && mover.might_end_material(self.attacker, effect)
-            && moves::cannot_win(&pos.play(m), self.attacker)
-        {
-            return child(self.settle(key, counter, Value::DRAWN, 0), false);
-        }
-        if !attacking {
-            // A defence likely to refute is tried first: a check, a blast
-            // that removes an attacking piece, or kings that can touch.
-            let attackers = pos.by_color(self.attacker) & !pos.by_role(shakmaty::Role::Pawn);
-            let good = check
-                || (effect.capture && (attackers & !effect.occupied).any())
-                || mover.connectable(m, effect);
-            let disproof = if good { 1 } else { UNLIKELY };
-            return Child {
-                fresh: true,
-                ..child(Value::open(Numbers { proof: 1, disproof }), false)
-            };
-        }
-        let threats = if check { 0 } else { mover.threats(m, effect) };
-        // So does a double threat no defence parries.
-        if threats >= 2 && self.exposed(&pos.play(m)).is_some() {
-            return child(Value::WON, false);
-        }
-        let proof = if check {
-            check_proof
-        } else {
-            match threats {
-                0 if mover.plain(m) && mover.blasted_cheaply(m, effect) => HANGING,
-                0 => QUIET,
-                1 if mover.blasted_cheaply(m, effect) => WEAK_THREAT,
-                1 => THREAT,
-                _ => 1,
-            }
-        };
-        Child {
-            fresh: true,
-            ..child(Value::open(Numbers { proof, disproof: 1 }), false)
-        }
-    }
-
-    /// A child reached by a capture or pawn move as the tablebases score it,
-    /// where they hold it: won, its proof kept, with any moves left, unless
-    /// the search is exact; otherwise refuted, as the table then keeps it
-    /// for these moves left, so that the tables are read once.
-    fn tablebase_value(
-        &mut self,
-        pos: &Position,
-        m: Move,
-        effect: &Effect,
-        key: u64,
-        seen: bool,
-    ) -> Option<Value> {
-        let tables = self.tablebase?;
-        if effect.occupied.count() > tables.max_pieces() {
-            return None;
-        }
-        if seen
-            && let Some(value) = self.lookup(key, 0, |_| false)
-            && value.numbers.disproof == 0
-        {
-            return Some(value);
-        }
-        let verdict = tables.probe(&pos.play(m).to_atomic())?;
-        let attacker_wins = if pos.turn() == self.attacker {
-            verdict == Verdict::Loss
-        } else {
-            verdict == Verdict::Win
-        };
-        if !attacker_wins {
-            self.store(key, 0, Value::DRAWN, 0);
-            return Some(Value::DRAWN);
-        }
-        if self.exact {
-            return None;
-        }
-        self.add_proof(effect.hash, Proof::TABLEBASE);
-        Some(Value::WON)
     }
 
     /// The depth of a child's position on the current line, if it repeats
@@ -1783,390 +1249,6 @@ impl<'a> Dfpn<'a> {
         }
     }
 
-    /// Tries to prove `pos`, attacker to move, by replaying the proof of
-    /// `guide`, a similar position (Kawano's simulation): the attacker plays
-    /// the guide's winning moves, and every defence must be answered by a
-    /// known proof, an explosion at once, or the same defence in the guide.
-    /// The proofs it finds are recorded as the search records its own, so it
-    /// is exact; it gives up when the budget runs out. Under a limit, a proof
-    /// must take at most `remaining` attacker moves: a known one that takes
-    /// more leaves the replay to look for a shorter one.
-    fn simulate(
-        &mut self,
-        pos: &Position,
-        guide: &Position,
-        remaining: u32,
-        budget: &mut u32,
-        line: &mut Vec<u64>,
-    ) -> Option<(u32, u32)> {
-        let counter = pos.halfmoves();
-        if let Some(proof) = self.proof_at(pos.hash(), counter)
-            && proof.length <= remaining
-        {
-            return Some((proof.length, proof.limit));
-        }
-        if counter > LAST || *budget == 0 || remaining == 0 || self.on_line(pos.hash(), line) {
-            return None;
-        }
-        *budget -= 1;
-        self.nodes += 1;
-        let m = match self.proof_at(guide.hash(), guide.halfmoves()) {
-            Some(proof) => proof.m?,
-            None => self.explosion(guide).or_else(|| self.dropped_mate(guide))?,
-        };
-        if !pos.is_pseudo_legal(m) || !pos.legal(m) {
-            return None;
-        }
-        let after = pos.play(m);
-        line.push(pos.hash());
-        let reached = self.simulate_defences(&after, &guide.play(m), remaining - 1, budget, line);
-        line.pop();
-        let (length, limit) = reached?;
-        let mates = mated(length, limit);
-        let limit = if after.halfmoves() == 0 {
-            LAST
-        } else {
-            limit.saturating_sub(1).min(LAST)
-        };
-        let proof = Proof {
-            m: Some(m),
-            length: length + 1,
-            limit,
-        };
-        // A capture that explodes the king at once is not kept.
-        if after.king(!self.attacker).is_some() {
-            self.keep_attacker(pos, proof, mates);
-        }
-        Some((proof.length, proof.limit))
-    }
-
-    /// The defender's side of `simulate`, with `remaining` attacker moves
-    /// left.
-    fn simulate_defences(
-        &mut self,
-        pos: &Position,
-        guide: &Position,
-        remaining: u32,
-        budget: &mut u32,
-        line: &mut Vec<u64>,
-    ) -> Option<(u32, u32)> {
-        if pos.king(!self.attacker).is_none() {
-            return Some((0, u32::MAX));
-        }
-        let counter = pos.halfmoves();
-        if let Some(proof) = self.proof_at(pos.hash(), counter)
-            && proof.length <= remaining
-        {
-            return Some((proof.length, proof.limit));
-        }
-        if counter > LAST || self.on_line(pos.hash(), line) {
-            return None;
-        }
-        let mover = Mover::new(pos);
-        let mut length = 0;
-        let mut limit = LAST;
-        let mut defences = 0;
-        line.push(pos.hash());
-        let mut answered = true;
-        // Whether every defence lets the king be exploded at once, which
-        // makes the proof one `recomputed` finds again.
-        let mut exposed = true;
-        for &reply in pos.pseudo_legal().as_slice() {
-            if !mover.legal(reply) {
-                continue;
-            }
-            defences += 1;
-            let effect = mover.effect(reply);
-            if mover.explodes_them(&effect) {
-                answered = false;
-                break;
-            }
-            let next = pos.play(reply);
-            let exposing = next.halfmoves() <= LAST && mover.exposes(reply, &effect);
-            exposed &= exposing;
-            let reached = if exposing {
-                moves::exploding_capture(&next, self.attacker)
-                    .filter(|_| remaining > 0)
-                    .map(|_| (1, LAST))
-            } else if let Some(proof) = self
-                .proof_at(next.hash(), next.halfmoves())
-                .filter(|proof| proof.length <= remaining)
-            {
-                Some((proof.length, proof.limit))
-            } else if guide.is_pseudo_legal(reply) && guide.legal(reply) {
-                self.simulate(&next, &guide.play(reply), remaining, budget, line)
-            } else {
-                None
-            };
-            let Some((reply_length, reply_limit)) = reached else {
-                answered = false;
-                break;
-            };
-            length = length.max(reply_length);
-            limit = limit.min(if next.halfmoves() == 0 {
-                LAST
-            } else {
-                reply_limit.saturating_sub(1).min(LAST)
-            });
-        }
-        line.pop();
-        // No defence at all is a mate if in check, else a stalemate.
-        if !answered || (defences == 0 && !pos.in_check()) {
-            return None;
-        }
-        let proof = if defences == 0 {
-            Proof::FINISHED
-        } else {
-            Proof {
-                m: None,
-                length,
-                limit,
-            }
-        };
-        // A mate, or a defence every move of which lets the king be exploded,
-        // is not kept: `recomputed` finds it again.
-        if defences != 0 && !(exposed && counter < LAST) {
-            self.add_proof(pos.hash(), proof);
-        }
-        debug_assert!(
-            defences != 0 && !(exposed && counter < LAST) || self.recomputed(pos) == Some(proof)
-        );
-        Some((proof.length, proof.limit))
-    }
-
-    /// The proof of a position, defender to move, in which every move lets
-    /// the attacker explode the king at once, short of the 50-move limit: a
-    /// win in two attacker moves, settled without a search and not kept.
-    fn exposed(&self, pos: &Position) -> Option<Proof> {
-        if pos.halfmoves() >= LAST {
-            return None;
-        }
-        let mover = Mover::new(pos);
-        let mut any = false;
-        let mut limit = LAST;
-        for &reply in pos.pseudo_legal().as_slice() {
-            if !mover.legal(reply) {
-                continue;
-            }
-            let effect = mover.effect(reply);
-            if mover.explodes_them(&effect) || !mover.exposes(reply, &effect) {
-                return None;
-            }
-            any = true;
-            // Where a reply leaves the 50-move counter running, the win holds
-            // at one counter less.
-            if effect.counter != 0 {
-                limit = LAST - 1;
-            }
-        }
-        any.then_some(Proof {
-            m: None,
-            length: 1,
-            limit,
-        })
-    }
-
-    /// The proof of a position whose proof is not kept because it comes out
-    /// the same whenever it is worked out again: the attacker exploding the
-    /// king at once, the defender mated, or a defence after which every move
-    /// lets the king be exploded; and once the proofs have dropped them, a
-    /// mate in one.
-    fn recomputed(&self, pos: &Position) -> Option<Proof> {
-        if pos.turn() == self.attacker {
-            let m = self.explosion(pos).or_else(|| self.dropped_mate(pos))?;
-            return Some(Proof {
-                m: Some(m),
-                length: 1,
-                limit: LAST,
-            });
-        }
-        if pos.in_check() && !moves::has_legal_move(pos) {
-            return Some(Proof::FINISHED);
-        }
-        self.exposed(pos)
-    }
-
-    /// A check the defender has no move against, before the 50-move limit.
-    fn mate_in_one(&self, pos: &Position) -> Option<Move> {
-        if pos.halfmoves() > LAST {
-            return None;
-        }
-        let mover = Mover::new(pos);
-        pos.pseudo_legal()
-            .as_slice()
-            .iter()
-            .copied()
-            .find(|&m| mates(&mover, pos, m))
-    }
-
-    /// A mate in one, once the proofs have dropped them and keep none.
-    fn dropped_mate(&self, pos: &Position) -> Option<Move> {
-        if self.mates_kept() {
-            None
-        } else {
-            self.mate_in_one(pos)
-        }
-    }
-
-    /// Whether a move mates at once in an attacker position, as `mate_in_one`
-    /// finds a mate: how a mate in one the table notes is checked.
-    fn mates_with(&self, pos: &Position, m: Move) -> bool {
-        pos.turn() == self.attacker
-            && pos.halfmoves() <= LAST
-            && pos.is_pseudo_legal(m)
-            && mates(&Mover::new(pos), pos, m)
-    }
-
-    /// The proof of the attacker exploding the king at once.
-    fn exploding(&self, pos: &Position) -> Option<Proof> {
-        self.explosion(pos).map(|m| Proof {
-            m: Some(m),
-            length: 1,
-            limit: LAST,
-        })
-    }
-
-    /// Keeps an attacker position's proof, mated whether its move mates,
-    /// unless it explodes the king at once: those make up most short proofs,
-    /// and replays make many of them.
-    fn keep_proof(&mut self, pos: &Position, proof: Proof, mated: bool) {
-        if proof.length <= 1 && self.exploding(pos) == Some(proof) {
-            return;
-        }
-        self.keep_attacker(pos, proof, mated);
-    }
-
-    /// Keeps an attacker position's proof, mated whether its move mates. Once
-    /// the proofs have dropped their mates in one, a position that has one
-    /// keeps no proof, and drops any it kept before: a parent may count on
-    /// the mate, as `recomputed` finds it, and a longer proof found by lookup
-    /// would make the parent's win longer than it says. The table notes the
-    /// mate instead, so that meeting the position again costs a check of its
-    /// move rather than a node.
-    fn keep_attacker(&mut self, pos: &Position, proof: Proof, mated: bool) {
-        let hash = pos.hash();
-        if self.mates_kept() {
-            if !mated {
-                self.add_proof(hash, proof);
-                return;
-            }
-            self.filtering = self.table().note(hash, self.filtering);
-            if self.proofs().add_mate(hash, proof) && self.proofs().taken() < self.drop_mates_at {
-                return;
-            }
-            // Dropped with the others.
-            self.drop_mates();
-        }
-        let mate = if mated {
-            proof.m
-        } else {
-            self.mate_in_one(pos)
-        };
-        match mate {
-            Some(m) => {
-                self.proofs().remove(hash);
-                // With a limit, the table's keys count the moves left.
-                if self.most.is_none() {
-                    let known = Known::Mate(m.bits());
-                    self.filtering = self.table().put(hash, known, 1, self.filtering);
-                    self.puts += usize::from(self.together);
-                    self.refresh_filter();
-                }
-            }
-            None => self.add_proof(hash, proof),
-        }
-    }
-
-    /// Replays on a defender position's open defences the win the attacker
-    /// would have at once if the defender passed: the first move the tactics
-    /// that score moves find winning (an explosion, a check every evasion of
-    /// loses, a double threat no defence parries, or a move into a known
-    /// proof). It becomes the passed position's proof, and each defence it
-    /// still answers is proven by replaying it, as a proven sibling's proof
-    /// is replayed; a defence that parries it starts at half its proof
-    /// number. Plain moves are not tried: they win at once only into a known
-    /// proof.
-    fn replay_threat(&mut self, pos: &Position, remaining: u32, children: &mut [Child]) {
-        let passed = pos.null();
-        let left = remaining.saturating_sub(1);
-        let counter = passed.halfmoves();
-        if counter > LAST {
-            return;
-        }
-        if self.proof_at(passed.hash(), counter).is_none() {
-            let mover = Mover::new(&passed);
-            let mut win = None;
-            // The moves first, their table reads started, as `children` does.
-            let mut moves = std::mem::take(&mut self.scratch);
-            moves.clear();
-            let filtering = self.filtering;
-            for &m in passed.pseudo_legal().as_slice() {
-                if mover.plain(m) || !mover.legal(m) {
-                    continue;
-                }
-                let effect = mover.full_effect(m);
-                self.prefetch_child(effect.hash, left, filtering);
-                moves.push((m, effect, !filtering));
-            }
-            if filtering {
-                self.read_filter(&mut moves, left);
-            }
-            self.mark_repetitions(passed.halfmoves());
-            for &(m, effect, seen) in &moves {
-                // Only whether the move wins at once counts here, so a check
-                // needs one surviving evasion, not their number.
-                let child = self.evaluate(&passed, &mover, m, &effect, seen, true, left, 1);
-                if child.value.numbers.proof != 0 {
-                    continue;
-                }
-                let (length, limit) = if child.exploded {
-                    (0, u32::MAX)
-                } else if let Some(proof) = self
-                    .proof_at(child.hash, child.counter)
-                    .or_else(|| self.recomputed(&passed.play(m)))
-                {
-                    (proof.length, proof.limit)
-                } else {
-                    continue;
-                };
-                let mates = !child.exploded && mated(length, limit);
-                let limit = if child.counter == 0 {
-                    LAST
-                } else {
-                    limit.saturating_sub(1).min(LAST)
-                };
-                let proof = Proof {
-                    m: Some(m),
-                    length: length + 1,
-                    limit,
-                };
-                win = Some((proof, mates));
-                break;
-            }
-            self.scratch = moves;
-            let Some((proof, mates)) = win else {
-                return;
-            };
-            self.keep_proof(&passed, proof, mates);
-        }
-        for child in children.iter_mut() {
-            if child.value.numbers.proof == 0 || child.value.numbers.disproof == 0 {
-                continue;
-            }
-            let position = pos.play(child.m);
-            let mut budget = SIMULATION;
-            let mut line = std::mem::take(&mut self.line);
-            let reached = self.simulate(&position, &passed, remaining, &mut budget, &mut line);
-            self.line = line;
-            if reached.is_some_and(|(length, _)| length <= remaining) {
-                child.value = Value::WON;
-                child.simulated = true;
-            } else if child.fresh {
-                child.value.numbers.proof = (child.value.numbers.proof / 2).max(1);
-            }
-        }
-    }
-
     /// Whether a position is on the search's line or the replay's.
     fn on_line(&self, hash: u64, line: &[u64]) -> bool {
         self.path.contains(&hash) || line.contains(&hash)
@@ -2179,18 +1261,6 @@ impl<'a> Dfpn<'a> {
             self.store(hash, counter, value, work);
         }
         value
-    }
-
-    /// The value of a mate, if the side to move, in check, is mated.
-    fn mated(&self, pos: &Position) -> Option<Value> {
-        if moves::has_legal_move(pos) {
-            return None;
-        }
-        Some(if pos.turn() == self.attacker {
-            Value::DRAWN
-        } else {
-            Value::WON
-        })
     }
 
     /// The attacker moves left `depth` plies from the root.
@@ -2228,19 +1298,6 @@ impl<'a> Dfpn<'a> {
         } else {
             self.table().prefetch(self.key(hash, remaining));
             self.proofs().prefetch(hash);
-        }
-    }
-
-    /// Reads the filter's bit of every listed child, their words' loads under
-    /// way, and starts the table reads of the children it may hold.
-    fn read_filter(&self, moves: &mut [(Move, Effect, bool)], remaining: u32) {
-        for (_, effect, seen) in moves.iter_mut() {
-            let key = self.key(effect.hash, remaining);
-            *seen = self.seen(effect.hash, key);
-            if *seen {
-                self.table().prefetch(key);
-                self.proofs().prefetch(effect.hash);
-            }
         }
     }
 
@@ -2318,7 +1375,7 @@ impl<'a> Dfpn<'a> {
         if !self.together && self.table().filter_is_stale() {
             self.filtering = self
                 .table()
-                .rebuild_filter(self.proofs().keys(), self.proofs().taken());
+                .rebuild_filter(self.proofs().checks(), self.proofs().taken());
         }
     }
 
@@ -2332,7 +1389,7 @@ impl<'a> Dfpn<'a> {
             if store.table.filter_is_stale() {
                 store
                     .table
-                    .rebuild_filter(store.proofs.keys(), store.proofs.taken());
+                    .rebuild_filter(store.proofs.checks(), store.proofs.taken());
             } else if store.table.filter_is_dense() {
                 store.table.drop_filter();
             }
@@ -2363,99 +1420,10 @@ impl<'a> Dfpn<'a> {
         self.proofs().get(hash, counter)
     }
 
-    /// The attacker's capture that explodes the defender's king at once before
-    /// the 50-move limit: the proof of a position whose proof is not kept.
-    fn explosion(&self, pos: &Position) -> Option<Move> {
-        if pos.halfmoves() > LAST {
-            return None;
-        }
-        moves::exploding_capture(pos, self.attacker)
-    }
-
-    /// Records a proven position: attacking, through the shortest winning
-    /// move; defending, through every defence.
-    fn record_proof(&mut self, pos: &Position, hash: u64, children: &[Child], attacking: bool) {
-        // A child's proof seen from here: its length, the highest counter
-        // here it holds at, which a capture or pawn move frees, and whether it
-        // is the defender mated.
-        let reach = |child: &Child| -> Option<(u32, u32, bool)> {
-            let counter = child.counter;
-            let (length, limit) = if child.exploded {
-                (0, u32::MAX)
-            } else if child.winning {
-                (1, LAST)
-            } else {
-                if child.value.numbers.proof != 0 {
-                    return None;
-                }
-                let proof = self
-                    .proof_at(child.hash, counter)
-                    .or_else(|| self.recomputed(&pos.play(child.m)))?;
-                (proof.length, proof.limit)
-            };
-            let mates = !child.exploded && mated(length, limit);
-            let limit = if counter == 0 {
-                LAST
-            } else {
-                limit.saturating_sub(1).min(LAST)
-            };
-            Some((length, limit, mates))
-        };
-        let proof = if attacking {
-            children
-                .iter()
-                .filter(|child| !child.group)
-                .filter_map(|child| reach(child).map(|reached| (child.m, reached)))
-                .min_by_key(|&(_, (length, limit, _))| (length, Reverse(limit)))
-                .map(|(m, (length, limit, mates))| {
-                    let proof = Proof {
-                        m: Some(m),
-                        length: length + 1,
-                        limit,
-                    };
-                    (proof, mates)
-                })
-        } else {
-            children
-                .iter()
-                .map(reach)
-                .try_fold(
-                    Proof {
-                        m: None,
-                        length: 0,
-                        limit: LAST,
-                    },
-                    |proof, reached| {
-                        let (length, limit, _) = reached?;
-                        Some(Proof {
-                            m: None,
-                            length: proof.length.max(length),
-                            limit: proof.limit.min(limit),
-                        })
-                    },
-                )
-                .map(|proof| (proof, false))
-        };
-        if attacking && let Some((Proof { m: Some(m), .. }, _)) = proof {
-            let index = history_index(pos, m);
-            self.attack_history[index] = self.attack_history[index].saturating_add(1);
-        }
-        if let Some((proof, mates)) = proof {
-            debug_assert_eq!(hash, pos.hash());
-            // An attacker's shortest win longer than one move leaves no mate
-            // in one there: one would have been shorter.
-            if attacking && proof.length <= 1 {
-                self.keep_proof(pos, proof, mates);
-            } else if attacking
-                || !(pos.halfmoves() < LAST && children.iter().all(|child| child.winning))
-            {
-                self.add_proof(hash, proof);
-            }
-        }
-    }
-
     /// Keeps a proof. When the proofs fill, the first time they drop their
-    /// mates in one (`drop_mates`), and the second the search stops.
+    /// mates in one (`drop_mates`), and each time after that their short
+    /// proofs (`drop_short`), until that no longer lets the search go on,
+    /// which then stops.
     fn add_proof(&mut self, hash: u64, proof: Proof) {
         self.filtering = self.table().note(hash, self.filtering);
         if self.proofs().add(hash, proof) {
@@ -2469,6 +1437,9 @@ impl<'a> Dfpn<'a> {
             if self.proofs().add(hash, proof) {
                 return;
             }
+        }
+        if self.drop_short() && self.proofs().add(hash, proof) {
+            return;
         }
         self.full = true;
         self.stopped = true;
@@ -2508,6 +1479,48 @@ impl<'a> Dfpn<'a> {
         if self.mates_dropped.is_none() {
             self.mates_dropped = *lock(&store.mates_dropped);
         }
+    }
+
+    /// Drops every proof of at most `proofs::SHORT` moves from the proofs, so
+    /// that the search goes on when they fill without their mates in one:
+    /// most proofs are that short, and the search works one out again where
+    /// it needs it (`short_proof`), as a proof's walk does (`winning_move`).
+    /// The longer ones are never dropped, so the lengths still shrink along
+    /// every line of a proof. Returns whether the search goes on: not once
+    /// the longer proofs take more than nine tenths of the room, when the
+    /// drops would soon come one after another; and not under a limit on
+    /// moves, where nothing is dropped: a longer proof a position keeps could
+    /// then stand in for its short one and pass the limit.
+    fn drop_short(&mut self) -> bool {
+        if self.most.is_some() {
+            return false;
+        }
+        if self.together {
+            return self.drop_short_alone();
+        }
+        self.proofs().drop_short();
+        self.store.short_drops.fetch_add(1, Relaxed);
+        self.proofs().taken() * 10 <= self.proofs().room() * 9
+    }
+
+    /// Together: `drop_short` while the other threads wait, unless the proofs
+    /// have room again, as they do when another thread's drop came first.
+    #[cold]
+    fn drop_short_alone(&mut self) -> bool {
+        let store = &*self.store;
+        store.pause.alone(|| {
+            let proofs = &store.proofs;
+            if proofs.taken() >= proofs.room() {
+                proofs.drop_short();
+                store.short_drops.fetch_add(1, Relaxed);
+                if proofs.taken() * 10 > proofs.room() * 9 {
+                    store.full.store(true, Relaxed);
+                }
+            }
+        });
+        // Another thread's change may have come first.
+        self.filtering = store.table.filtering();
+        !store.full.load(Relaxed)
     }
 
     fn tick(&mut self) {
@@ -2643,7 +1656,7 @@ impl<'a> Dfpn<'a> {
         };
         let mut moves = Vec::with_capacity(levels.len());
         for level in levels {
-            moves.push(UciMove::from_standard(pos.to_shakmaty(level.m)).to_string());
+            moves.push(pos.uci(level.m));
             pos = pos.play(level.m);
         }
         (moves, levels.iter().map(|level| level.open).collect())
@@ -2658,7 +1671,7 @@ impl<'a> Dfpn<'a> {
             .iter()
             .rev()
             .max_by_key(|(_, nodes)| *nodes)?;
-        Some(UciMove::from_standard(root.to_shakmaty(m)).to_string())
+        Some(root.uci(m))
     }
 
     /// Prints a line on how the search goes, as JSON to standard error, or
@@ -2668,9 +1681,10 @@ impl<'a> Dfpn<'a> {
     /// (`peak`), the line and the moves open along it (`line`, `open`), the
     /// root move searched most (`most_searched`, once one is), the share of
     /// the table's slots taken (from a sample), how full the proofs are, 1
-    /// being where they fill, and the nodes searched when they dropped their
-    /// mates in one, once they have. Together, the line and the moves are
-    /// this thread's.
+    /// being where they fill, the nodes searched when they dropped their
+    /// mates in one, once they have, and how many times they have dropped
+    /// their short proofs since. Together, the line and the moves are this
+    /// thread's.
     fn report(&mut self, now: Instant) {
         if self.progress.is_none() {
             return;
@@ -2688,7 +1702,12 @@ impl<'a> Dfpn<'a> {
         };
         let table = (self.store.table.fill() * 1000.0).round() / 1000.0;
         let proofs = (self.store.proofs.fill() * 1000.0).round() / 1000.0;
-        let dropped = self.mates_dropped;
+        let dropped = self.mates_dropped.or_else(|| {
+            self.together
+                .then(|| *lock(&self.store.mates_dropped))
+                .flatten()
+        });
+        let short_drops = self.short_drops();
         let peak = self.peak;
         let Some(progress) = &mut self.progress else {
             return;
@@ -2714,6 +1733,9 @@ impl<'a> Dfpn<'a> {
         }
         if let Some(nodes) = dropped {
             record["mates_dropped"] = serde_json::json!(nodes);
+        }
+        if short_drops > 0 {
+            record["short_drops"] = serde_json::json!(short_drops);
         }
         match &mut progress.sink {
             Some(sink) => sink(&record),
@@ -2785,90 +1807,14 @@ pub fn proofs_needed(seconds: Option<f64>, nodes: Option<u64>) -> usize {
 }
 
 /// Proof memory a search may need for each second of its time limit and each
-/// node of its budget, at 12 bytes a proof.
+/// node of its budget, at 10 bytes a proof.
 const PROOF_MB_A_SECOND: f64 = 1.5;
+
 const PROOF_BYTES_A_NODE: u64 = 3;
 
 /// The most megabytes one table may take: no allocation reaches `isize::MAX`
 /// bytes, which on 32-bit targets such as WebAssembly is 2 GB.
 const MOST_ONE: usize = isize::MAX as usize >> 20;
-
-/// `x.round()`. WebAssembly has no instruction for it and calls a library
-/// function, slowly; there, `round_by_truncation`.
-#[cfg(target_arch = "wasm32")]
-fn round(x: f32) -> f32 {
-    round_by_truncation(x)
-}
-
-/// `x.round()` from instructions WebAssembly has: the difference from the
-/// truncation is exact, and so is a step of one from it.
-#[cfg(any(target_arch = "wasm32", test))]
-fn round_by_truncation(x: f32) -> f32 {
-    let whole = x.trunc();
-    if (x - whole).abs() >= 0.5 {
-        whole + 1f32.copysign(x)
-    } else {
-        whole
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn round(x: f32) -> f32 {
-    x.round()
-}
-
-/// 10 to the `x`. Natively, `10f32.powf(x)` becomes the system's exp10f;
-/// WebAssembly has none and calls a slow powf: there, 2 to the x log2(10) in
-/// double precision, rounded once.
-#[cfg(target_arch = "wasm32")]
-fn exp10(x: f32) -> f32 {
-    (f64::from(x) * std::f64::consts::LOG2_10).exp2() as f32
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn exp10(x: f32) -> f32 {
-    10f32.powf(x)
-}
-
-/// Scales the new children's starting numbers by their parent's evaluation,
-/// as EF-PN does (Winands and Schadd): `attacking` when the parent is the
-/// attacker's, `step` from 0 (the defender clearly ahead) to 2. Between those,
-/// a model's step scales both numbers, uncapped and alike: proof numbers
-/// grow by 10^(-MAGNITUDE logit) and disproof numbers by 10^(MAGNITUDE
-/// logit) from EF-PN's at an average position.
-fn scale(children: &mut [Child], attacking: bool, step: Option<f32>) {
-    let Some(step) = step else {
-        return;
-    };
-    let (a, b) = (EF_A as f32, EF_B as f32);
-    let times = |number: u32, factor: f32| (round(number as f32 * factor) as u32).min(1 << 24);
-    let logit = (step > 0.0 && step < 2.0).then(|| (step / (2.0 - step)).ln());
-    let effort = logit.map(|logit| exp10(-MAGNITUDE * logit));
-    let refute = logit.map(|logit| exp10(MAGNITUDE * logit));
-    for child in children.iter_mut().filter(|child| child.fresh) {
-        let numbers = &mut child.value.numbers;
-        if attacking {
-            numbers.proof = match effort {
-                Some(effort) => times(numbers.proof, ((1.0 + b) * effort).max(1.0)),
-                None => times(numbers.proof, 1.0 + b * (2.0 - step)),
-            };
-            numbers.disproof = match refute {
-                Some(refute) => times(numbers.disproof, ((1.0 + a) * refute).max(1.0)),
-                None => times(numbers.disproof, 1.0 + a * step),
-            };
-        } else {
-            // A defence's new children start at proof number 1.
-            numbers.proof = match effort {
-                Some(effort) => times(numbers.proof, ((1.0 + a) * effort).max(1.0)),
-                None => times(numbers.proof, 1.0) + round(a * (2.0 - step)) as u32,
-            };
-            numbers.disproof = match refute {
-                Some(refute) => times(numbers.disproof, ((1.0 + b) * refute).max(1.0)),
-                None => times(numbers.disproof, 1.0 + b * step),
-            };
-        }
-    }
-}
 
 /// Combines the children: the position's value, the child to search, and the
 /// second-best child's deciding number, each child's deciding number as
@@ -2996,21 +1942,6 @@ fn busy_slots() -> Result<Vec<AtomicU16>, TryReserveError> {
     Ok(busy)
 }
 
-/// A model's step, between 0 and 2, with its odds, step / (2 - step), moved
-/// by `unit` percent: computed in f64 and kept off the endpoints, which
-/// `scale` treats apart.
-fn perturb_model_step(step: f32, unit: f32) -> f32 {
-    debug_assert!((0.0..=2.0).contains(&step));
-    debug_assert!((-1.0..=1.0).contains(&unit));
-    if step == 0.0 || step == 2.0 {
-        return step;
-    }
-    let multiplier = 1.0 + 0.01 * f64::from(unit);
-    let value = f64::from(step);
-    let perturbed = (2.0 * value * multiplier / (2.0 - value + value * multiplier)) as f32;
-    perturbed.clamp(f32::from_bits(1), f32::from_bits(2.0f32.to_bits() - 1))
-}
-
 /// A child's limit on the number its parent sums: its own number plus what
 /// the sum may still grow by. A parent without a limit gives none: its sum may
 /// stand just below infinity (see `combine`), and taking that from infinity
@@ -3027,34 +1958,16 @@ fn capped(value: u32) -> u32 {
     value.min(INFINITY)
 }
 
-/// The 1+ε trick, ε = 1/8: a child may run until it is somewhat worse than
-/// the second-best one, which spares many switches between near-equal
-/// children.
-fn widen(second: u32) -> u32 {
+/// The 1+ε trick, ε = 1/`epsilon` (`Variant::EPSILON`): a child may run
+/// until it is somewhat worse than the second-best one, which spares many
+/// switches between near-equal children.
+#[inline(always)]
+fn widen(second: u32, epsilon: u32) -> u32 {
     if second >= INFINITY {
         INFINITY
     } else {
-        capped(second + 1 + second / 8)
+        capped(second + 1 + second / epsilon)
     }
-}
-
-/// A move's place in the history tables: its piece and destination.
-fn history_index(pos: &Position, m: Move) -> usize {
-    let role = pos.role_at(m.from()).map_or(0, |role| role as usize);
-    role * 64 + m.to() as usize
-}
-
-/// Whether a pseudo-legal move mates: a check the other side has no move
-/// against, rather than an explosion of its king.
-fn mates(mover: &Mover, pos: &Position, m: Move) -> bool {
-    // Plain moves check nothing, and telling them costs a bit test.
-    if mover.plain(m) || !mover.legal(m) {
-        return false;
-    }
-    let effect = mover.effect(m);
-    !mover.explodes_them(&effect)
-        && mover.gives_check(m, &effect)
-        && !moves::has_legal_move(&pos.play(m))
 }
 
 #[cfg(test)]
@@ -3063,13 +1976,15 @@ mod tests {
     use std::sync::atomic::Ordering::Relaxed;
     use std::time::{Duration, Instant};
 
-    use shakmaty::{Position as _, variant::Atomic};
+    use shakmaty::{Position as _, uci::UciMove, variant::Atomic};
 
+    use super::atomic::{perturb_model_step, scale};
     use super::{
-        Child, Dfpn, Guide, INFINITY, Level, Numbers, Proofs, Value, combine, crowd,
-        perturb_model_step, scale, share, split,
+        Child, Dfpn, Guide, INFINITY, Level, Numbers, Proof, Proofs, Value, combine, crowd, share,
+        split,
     };
-    use crate::board::from_fen;
+    use crate::board::{Move, Position, from_fen};
+    use crate::search::Key;
     use crate::tablebase::Tablebase;
 
     /// The length of a search's win as `provari prove` writes its proof, in
@@ -3086,13 +2001,22 @@ mod tests {
         tables: Option<(&Tablebase, &shakmaty_syzygy::Tablebase<Atomic>)>,
     ) -> u32 {
         let prover = tables.map(|(prover, _)| prover);
-        let (header, indices) = crate::format::walk(root, root.turn(), prover, |pos| {
-            let key = (pos.hash(), pos.halfmoves());
-            search
-                .winning_move(&pos.to_atomic(), &key)
-                .and_then(|m| crate::format::board_move(pos, &m))
-        })
-        .unwrap();
+        let write =
+            |winning_move: &mut dyn FnMut(&Atomic, &Key, bool) -> Option<shakmaty::Move>| {
+                crate::format::walk_search(root, root.turn(), prover, |pos, furthest| {
+                    let key = (pos.hash(), pos.halfmoves());
+                    winning_move(&pos.to_atomic(), &key, furthest)
+                        .and_then(|m| crate::format::board_move(pos, &m))
+                })
+                .unwrap()
+            };
+        let (header, indices, _) =
+            write(&mut |pos, key, furthest| search.winning_move(pos, key, furthest));
+        // Short wins worked out ahead by other threads give the same proof.
+        if search.short_drops() > 0 {
+            let (_, ahead, _) = search.with_moves_ahead(4, write);
+            assert_eq!(ahead, indices);
+        }
         let bytes = crate::format::file(&header, &indices).unwrap();
         let checker = tables.map(|(_, checker)| checker);
         let checked = crate::check::check_proof("proof", &bytes, checker);
@@ -3174,7 +2098,7 @@ mod tests {
             values.push(f32::from_bits(state as u32));
         }
         for x in values {
-            let (ours, theirs) = (super::round_by_truncation(x), x.round());
+            let (ours, theirs) = (super::atomic::round_by_truncation(x), x.round());
             assert!(
                 ours.to_bits() == theirs.to_bits() || (ours.is_nan() && theirs.is_nan()),
                 "{x}: {ours} for {theirs}"
@@ -3497,20 +2421,161 @@ mod tests {
         }
     }
 
-    /// A search whose proofs fill their memory drops its mates in one, and
-    /// once they fill again stops, and claims no win.
+    /// A search whose proofs fill their memory drops its mates in one, then
+    /// its short proofs each time they fill again, and stops once the longer
+    /// ones alone leave too little room, claiming no win. Under a limit on
+    /// moves it drops no short proofs, and stops when they fill again.
     #[test]
     fn stops_when_its_proofs_are_full() {
-        let root = from_fen("r1bqkbnr/1p1p2pp/p1n2p2/1B2p3/3PP3/2P2N2/PP3PPP/R1BQK2R w KQkq - 0 1")
+        let root = from_fen("r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1")
             .unwrap()
             .to_atomic();
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
-        assert!(search.solve(&root).is_some() && !search.proofs_full());
-        let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
-        Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::new(0, false).unwrap();
-        assert_eq!(search.solve(&root), None);
-        assert!(search.proofs_full() && search.stopped && search.mates_dropped.is_some());
+        let found = search.solve(&root);
+        assert!(found.is_some() && !search.proofs_full());
+        for most in [None, found] {
+            let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
+            Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::sized(16, false);
+            if let Some(most) = most {
+                search.set_most(most);
+            }
+            assert_eq!(search.solve(&root), None, "{most:?}");
+            assert!(search.proofs_full() && search.stopped && search.mates_dropped.is_some());
+            assert_eq!(search.short_drops() > 0, most.is_none(), "{most:?}");
+        }
+    }
+
+    /// Proofs that fill again once their mates in one are gone drop their
+    /// short proofs, as often as they fill, and the search goes on to a win,
+    /// its proof whole, where it used to stop: the smaller the proofs, the
+    /// more often. With room to spare nothing is dropped. Every short proof
+    /// these searches find is one the search for short wins works out again
+    /// (`check_short`), which the drops rely on.
+    #[test]
+    fn drops_its_short_proofs_and_goes_on() {
+        let solve = |fen: &str, places: Option<usize>| {
+            let root = from_fen(fen).unwrap().to_atomic();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut search = Dfpn::new(&root, None, Guide::Hand, deadline, split(4, 0));
+            if let Some(places) = places {
+                Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::sized(places, false);
+            }
+            search.checking = true;
+            let found = search.solve(&root);
+            let written = found.map(|_| checked_length(&search, &root));
+            assert!(
+                found.is_some() && written <= found && !search.proofs_full(),
+                "{fen} with {places:?}: {found:?} {written:?}"
+            );
+            assert!(search.checked > 0, "{fen} with {places:?}");
+            search.short_drops()
+        };
+        let three = "r1bqkbnr/1p1p2pp/p1n2p2/1B2p3/3PP3/2P2N2/PP3PPP/R1BQK2R w KQkq - 0 1";
+        let eight = "r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1";
+        assert_eq!((solve(three, None), solve(eight, None)), (0, 0));
+        assert!(solve(three, Some(4)) > 0);
+        let (few, many) = (solve(eight, Some(256)), solve(eight, Some(64)));
+        assert!(0 < few && few < many, "{few} {many}");
+    }
+
+    /// A position that keeps a short proof up to a low counter and a longer
+    /// one, with another move, up to a higher one gives a walk the shortest
+    /// that holds at its counter, or when asked the one that holds furthest,
+    /// the same move at every counter (`kept_proof`): `format::CIRCLE`'s
+    /// first rook position, with its two moves.
+    #[test]
+    fn gives_the_proof_that_holds_furthest() {
+        let pos = from_fen("2N1kN2/2R5/3PP3/7p/7P/8/7K/8 w - - 2 2").unwrap();
+        let root = pos.to_atomic();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut search = Dfpn::new(&root, None, Guide::None, deadline, (16, 8));
+        let uci =
+            |m: Option<Move>| m.map(|m| UciMove::from_standard(pos.to_shakmaty(m)).to_string());
+        let m = |uci: &str| {
+            let m = uci.parse::<UciMove>().unwrap().to_move(&root).unwrap();
+            crate::format::board_move(&pos, &m)
+        };
+        for (uci, length, limit) in [("c7f7", 3, 4), ("c7e7", 5, 40)] {
+            let proof = Proof {
+                m: m(uci),
+                length,
+                limit,
+            };
+            search.add_proof(pos.hash(), proof);
+        }
+        for (counter, shortest, furthest) in [
+            (2, Some("c7f7"), Some("c7e7")),
+            (4, Some("c7f7"), Some("c7e7")),
+            (5, Some("c7e7"), Some("c7e7")),
+            (40, Some("c7e7"), Some("c7e7")),
+            (41, None, None),
+        ] {
+            let at = pos.at_counter(counter);
+            let moves = [false, true].map(|furthest| uci(search.proof_move(&at, furthest)));
+            assert_eq!(
+                moves,
+                [shortest, furthest].map(|m| m.map(str::to_owned)),
+                "{counter}"
+            );
+            let key = (at.hash(), counter);
+            let (atomic, m) = (at.to_atomic(), search.proof_move(&at, true));
+            let written = search.winning_move(&atomic, &key, true);
+            assert_eq!(written, m.map(|m| at.to_shakmaty(m)), "{counter}");
+        }
+    }
+
+    /// With the tablebases, the short proofs dropped include the wins the
+    /// tables give where they are reached, worked out again from the tables:
+    /// searches of eight pieces whose proofs fill time and again go on to
+    /// their wins, each short proof found one the search for short wins
+    /// works out again, and each win's proof whole as the checker reads it
+    /// with the tables. An exact search, which plays tablebase wins out,
+    /// works its short proofs out again without the tables. With the tables
+    /// up to five pieces in `PROVARI_TABLEBASES` (a list as `PATH` is):
+    /// `cargo test --release -- --ignored drops_short_proofs_with_tablebases`.
+    #[test]
+    #[ignore = "needs the tablebases"]
+    fn drops_short_proofs_with_tablebases() {
+        let path = std::env::var_os("PROVARI_TABLEBASES").expect("PROVARI_TABLEBASES");
+        let tables = Tablebase::open(std::path::Path::new(&path)).unwrap();
+        let mut checker = shakmaty_syzygy::Tablebase::<Atomic>::new();
+        for directory in std::env::split_paths(&path) {
+            checker.add_directory(directory).unwrap();
+        }
+        // A pawn takes the rook, which leaves a queen the tables hold: a
+        // win in one move with them, in none where they hold the position
+        // itself, its counter at 0, and no short win without them.
+        let pawn = from_fen("8/8/5k2/8/2r5/3P4/8/K3Q3 w - - 3 1").unwrap();
+        let short = |pos: &Position, tables| {
+            crate::format::short(pos, shakmaty::Color::White, tables)
+                .map(|(length, m)| (length, m.is_some()))
+        };
+        assert_eq!(short(&pawn, Some(&tables)), Some((1, true)));
+        assert_eq!(short(&pawn.at_counter(0), Some(&tables)), Some((0, false)));
+        assert_eq!(short(&pawn, None), None);
+        for (fen, exact, places) in [
+            ("4k3/pp6/8/8/8/8/PP6/RB2K3 w - - 0 1", false, 1 << 12),
+            ("4k3/pp6/8/8/8/8/PP6/RN2K3 w - - 0 1", false, 1 << 14),
+            ("4k3/1p6/8/8/8/8/1P6/RN2K3 w - - 0 1", true, 1 << 13),
+        ] {
+            let root = from_fen(fen).unwrap().to_atomic();
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut search = Dfpn::new(&root, Some(&tables), Guide::Hand, deadline, split(64, 0));
+            Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::sized(places, false);
+            search.checking = true;
+            if exact {
+                search.set_exact();
+            }
+            let found = search.solve(&root);
+            assert!(found.is_some() && search.short_drops() > 0, "{fen}");
+            assert!(search.checked > 0, "{fen}");
+            let read = (!exact).then_some((&tables, &checker));
+            assert!(
+                Some(checked_length_with(&search, &root, read)) <= found,
+                "{fen}"
+            );
+        }
     }
 
     /// A search told to stop stops at its next look at the clock, within
@@ -3702,6 +2767,30 @@ mod tests {
         checked_length(&search, &root);
     }
 
+    /// Threads whose proofs fill again once their mates in one are gone drop
+    /// their short proofs while the others wait, as often as they fill, and
+    /// go on to the win, its proof whole. Two threads' lines keep more long
+    /// proofs than one's, which at this size now and then leaves too little
+    /// room: the search then stops, claiming no win, and another is run.
+    #[test]
+    fn threads_drop_their_short_proofs() {
+        let root = from_fen("r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1")
+            .unwrap()
+            .to_atomic();
+        let won = (0..20).any(|_| {
+            let mut search = together(&root, 2, split(4, 0));
+            Arc::get_mut(&mut search.store).unwrap().proofs = Proofs::sized(256, true);
+            search.checking = true;
+            let found = search.solve(&root);
+            assert_eq!(found.is_none(), search.proofs_full());
+            if found.is_some() {
+                checked_length(&search, &root);
+            }
+            found.is_some() && search.short_drops() > 0
+        });
+        assert!(won);
+    }
+
     /// Threads that find the table's filter a quarter set drop it while the
     /// others wait, and each stops reading it.
     #[test]
@@ -3890,5 +2979,122 @@ mod tests {
             !line.0.is_empty() && line.0.len() == line.1.len(),
             "{line:?}"
         );
+    }
+
+    /// A search with the network and the model takes every position's value
+    /// and first layer from its parent's, and grades a plain move without
+    /// its position: both as computed from scratch, which `network_value`
+    /// and `grade` assert at each position and move where debug assertions
+    /// are on, as in tests. The searches open with pieces to blow up, kings
+    /// that move and an ending; the test passes without checking when
+    /// `data/network.nnue` or `data/model.json` is absent.
+    #[test]
+    fn a_search_values_positions_as_from_scratch() {
+        use std::path::Path;
+
+        let (network, model) = (Path::new("data/network.nnue"), Path::new("data/model.json"));
+        if !cfg!(debug_assertions) || !network.exists() || !model.exists() {
+            return;
+        }
+        let network = crate::nnue::Network::load(network).unwrap();
+        let model = crate::model::Model::load(model).unwrap();
+        let mut nodes = 0;
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "rn2k2r/pp3ppp/2p5/3pP3/8/2N5/PPP2PPP/R3K2R w KQkq d6 0 1",
+            "r3k2r/1P4pp/8/2pP4/8/8/p5PP/R3K2R w KQkq c6 0 1",
+            "r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1",
+            "8/1p4pp/2pk4/8/P6P/7B/1PP5/6K1 w - - 1 20",
+        ] {
+            let root = from_fen(fen).unwrap().to_atomic();
+            let mut search = Dfpn::new(
+                &root,
+                None,
+                Guide::Model(&model, Some(&network)),
+                Instant::now() + Duration::from_secs(600),
+                split(64, 0),
+            );
+            search.set_limit(50_000);
+            search.solve(&root);
+            nodes += search.nodes;
+        }
+        assert!(nodes > 150_000, "{nodes}");
+    }
+
+    /// The same of a network in varifish's format, SFNNv20: the test's own,
+    /// of generated weights, with a model of weights as arbitrary, since
+    /// the values only need to be those from scratch.
+    #[test]
+    fn a_search_values_an_sfnnv20_networks_positions_as_from_scratch() {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let network = crate::nnue::tests::sfnnv20();
+        let mut random = crate::nnue::tests::Random(0x2545_f491_4f6c_dd1d);
+        let mut side = |bias: f32| {
+            let mut weights = |count: usize, scale: f32| -> Vec<f32> {
+                (0..count)
+                    .map(|_| ((random.next() % 2001) as f32 - 1000.0) * scale)
+                    .collect()
+            };
+            serde_json::json!({
+                "bias": bias,
+                "prior": 0.4,
+                "weights": weights(crate::model::FEATURES, 1e-3),
+                "layer": weights(crate::model::LAYER, 2e-4),
+            })
+        };
+        let model = serde_json::json!({
+            "features": crate::model::NAMES,
+            "attacker": side(-0.5),
+            "defender": side(0.5),
+        });
+        let model = crate::model::Model::from_text(&model.to_string()).unwrap();
+        let mut nodes = 0;
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "rn2k2r/pp3ppp/2p5/3pP3/8/2N5/PPP2PPP/R3K2R w KQkq d6 0 1",
+            "r3k2r/1P4pp/8/2pP4/8/8/p5PP/R3K2R w KQkq c6 0 1",
+            "r1b1kb1r/pp1p1qp1/2n1p3/1B3P1p/3PP3/2P5/PP4PP/R2QK2R w KQkq - 0 1",
+            "8/1p4pp/2pk4/8/P6P/7B/1PP5/6K1 w - - 1 20",
+        ] {
+            let root = from_fen(fen).unwrap().to_atomic();
+            let mut search = Dfpn::new(
+                &root,
+                None,
+                Guide::Model(&model, Some(&network)),
+                Instant::now() + Duration::from_secs(600),
+                split(64, 0),
+            );
+            search.set_limit(50_000);
+            search.solve(&root);
+            nodes += search.nodes;
+        }
+        assert!(nodes > 150_000, "{nodes}");
+    }
+
+    /// `clear` resets `stopped` and Atomic's history tables so that reusing a
+    /// `Dfpn` after a stopped search behaves as a fresh one of the same size.
+    #[test]
+    fn clear_resets_stopped_and_history_for_next_solve() {
+        let root = from_fen("1k1r4/ppp5/8/8/8/3Q4/PPP5/1K6 w - - 0 1")
+            .unwrap()
+            .to_atomic();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut fresh = Dfpn::new(&root, None, Guide::None, deadline, (16, 8));
+        let fresh_length = fresh.solve(&root).unwrap();
+        let fresh_nodes = fresh.nodes;
+
+        let mut reused = Dfpn::new(&root, None, Guide::None, deadline, (16, 8));
+        reused.set_limit(1);
+        assert_eq!(reused.solve(&root), None);
+        assert!(reused.stopped);
+
+        reused.clear();
+        reused.nodes = 0;
+        reused.set_limit(u64::MAX);
+        assert!(!reused.stopped);
+        assert_eq!(reused.solve(&root), Some(fresh_length));
+        assert_eq!(reused.nodes, fresh_nodes);
     }
 }

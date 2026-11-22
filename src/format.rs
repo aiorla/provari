@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use shakmaty::{CastlingSide, Color, EnPassantMode, Role, fen::Fen, variant::Atomic};
 
 use crate::board::{Move, Position};
-use crate::moves;
+use crate::moves::{self, Mover};
+use crate::proofs::SHORT;
 use crate::tablebase::{Tablebase, Verdict};
 
 /// The format's version.
@@ -122,6 +123,13 @@ fn is_capture(pos: &Position, m: Move) -> bool {
             .is_some_and(|piece| piece.color != pos.turn())
 }
 
+/// A defender position's legal moves in the order a walk takes them.
+pub fn replies(pos: &Position) -> Vec<Move> {
+    let mut replies = legal_moves(pos);
+    replies.sort_unstable_by_key(|&m| number(pos, m));
+    replies
+}
+
 /// The prover's move for a shakmaty one, if legal here.
 pub fn board_move(pos: &Position, m: &shakmaty::Move) -> Option<Move> {
     legal_moves(pos)
@@ -136,14 +144,27 @@ trait Chooser {
     fn choose(&mut self, pos: &Position, moves: &[Move]) -> Result<usize, String>;
 }
 
+/// What a walk keeps of a position it has proven: the highest counter yet,
+/// its length then, and the move written for it then, 0 for a position
+/// settled with nothing written (no move goes from a square to itself).
+#[derive(Clone, Copy)]
+struct Proven {
+    length: u32,
+    counter: u8,
+    written: u16,
+}
+
 struct Walk<'a, C> {
     attacker: Color,
     tablebase: Option<&'a Tablebase>,
     pieces: usize,
     chooser: C,
-    /// Each position proven, by hash, at the highest counter yet, with its
-    /// length then.
-    proven: HashMap<u64, (u32, u32)>,
+    /// Each position proven, by hash, at the highest counter yet.
+    proven: HashMap<u64, Proven>,
+    /// Whether a position was written again at a higher counter with
+    /// another move: without one, the moves written cannot link positions
+    /// in a circle (`walk_search`).
+    mixed: bool,
     /// The move of each position proven at its highest counter, if kept.
     strategy: Option<Strategy>,
     /// The most pieces of a position the tables gave a win or a loss, 0 for
@@ -189,22 +210,30 @@ impl<C: Chooser> Walk<'_, C> {
 
     fn attacker_to_move(&mut self, pos: &Position, legal: Vec<Move>) -> Result<u32, String> {
         let (hash, counter) = (pos.hash(), pos.halfmoves());
-        if let Some(&(highest, length)) = self.proven.get(&hash)
-            && counter <= highest
+        if let Some(proven) = self.proven.get(&hash)
+            && counter <= u32::from(proven.counter)
         {
-            return Ok(length);
+            return Ok(proven.length);
         }
         if !self.line.insert(hash) {
             return Err(format!("a line repeats {}", fen(pos)));
         }
-        let (length, m) = self.prove(pos, legal)?;
+        let (length, m, written) = self.prove(pos, legal)?;
         self.line.remove(&hash);
-        if self
-            .proven
-            .get(&hash)
-            .is_none_or(|&(highest, _)| counter > highest)
-        {
-            self.proven.insert(hash, (counter, length));
+        let before = self.proven.get(&hash).copied();
+        if before.is_none_or(|proven| counter > u32::from(proven.counter)) {
+            let written = if written { m.map_or(0, Move::bits) } else { 0 };
+            self.mixed |= before.is_some_and(|proven| {
+                proven.written != 0 && written != 0 && proven.written != written
+            });
+            self.proven.insert(
+                hash,
+                Proven {
+                    length,
+                    counter: counter as u8,
+                    written,
+                },
+            );
             if let Some(strategy) = &mut self.strategy {
                 strategy.insert(hash, m.map(|m| pos.to_shakmaty(m)));
             }
@@ -212,11 +241,16 @@ impl<C: Chooser> Walk<'_, C> {
         Ok(length)
     }
 
-    /// Proves an attacker position: its length, and its move, none for a
-    /// tablebase win.
-    fn prove(&mut self, pos: &Position, legal: Vec<Move>) -> Result<(u32, Option<Move>), String> {
+    /// Proves an attacker position: its length, its move, none for a
+    /// tablebase win, and whether the move is written rather than one the
+    /// position is settled by.
+    fn prove(
+        &mut self,
+        pos: &Position,
+        legal: Vec<Move>,
+    ) -> Result<(u32, Option<Move>, bool), String> {
         if self.verdict(pos)? == Some(Verdict::Win) {
-            return Ok((0, None));
+            return Ok((0, None, false));
         }
         // Checks first, then the format's order, which tells every move
         // apart. The positions after the moves are made again where needed,
@@ -226,7 +260,7 @@ impl<C: Chooser> Walk<'_, C> {
             let next = pos.play(m);
             let check = next.in_check();
             if won_at_once(&next, self.attacker, is_capture(pos, m), check) {
-                return Ok((1, Some(m)));
+                return Ok((1, Some(m), false));
             }
             moves.push((!check, number(pos, m), m));
         }
@@ -234,7 +268,7 @@ impl<C: Chooser> Walk<'_, C> {
         for &(_, _, m) in moves.iter().take_while(|&&(quiet, ..)| !quiet) {
             let decided = self.decided.get();
             if let Some(length) = self.wins_in_two(&pos.play(m))? {
-                return Ok((length, Some(m)));
+                return Ok((length, Some(m), false));
             }
             // A check that does not win in two would not with fewer tables
             // either, so the verdicts met in its lines are not the proof's.
@@ -246,7 +280,7 @@ impl<C: Chooser> Walk<'_, C> {
         let m = ordered[self.chooser.choose(pos, &ordered)?];
         let next = pos.play(m);
         let replies = legal_moves(&next);
-        Ok((1 + self.defender_to_move(&next, replies)?, Some(m)))
+        Ok((1 + self.defender_to_move(&next, replies)?, Some(m), true))
     }
 
     /// Whether a check leaves the defender lost at once whatever it does,
@@ -321,6 +355,193 @@ impl<C: Chooser> Walk<'_, C> {
         self.line.remove(&pos.hash());
         Ok(longest)
     }
+}
+
+/// A win of at most `SHORT` attacker moves in an open position, worked out
+/// from the position alone: its length as the search counts one, a tablebase
+/// win counting none where it is reached, and the attacker's move where it
+/// is to move, none for a tablebase win. The shortest comes first, so that
+/// the lengths shrink along every line these moves follow. For a search whose
+/// proofs have dropped their short ones (`Proofs::drop_short`): it works them
+/// out again here, and so do the moves it gives a proof's walk.
+pub fn short(
+    pos: &Position,
+    attacker: Color,
+    tablebase: Option<&Tablebase>,
+) -> Option<(u32, Option<Move>)> {
+    if pos.turn() != attacker {
+        return (0..=SHORT)
+            .find(|&moves| lost_within(pos, attacker, tablebase, moves))
+            .map(|moves| (moves, None));
+    }
+    let legal = legal_moves(pos);
+    if judge(pos, attacker, &legal) != State::Open {
+        return None;
+    }
+    if held_verdict(pos, tablebase) == Some(Verdict::Win) {
+        return Some((0, None));
+    }
+    (1..=SHORT).find_map(|moves| {
+        win_within(pos, attacker, tablebase, moves, &legal).map(|m| (moves, Some(m)))
+    })
+}
+
+/// A move with which the attacker wins within `moves` of its moves: at once,
+/// or into a position the defender is lost in within one move less.
+fn win_within(
+    pos: &Position,
+    attacker: Color,
+    tablebase: Option<&Tablebase>,
+    moves: u32,
+    legal: &[Move],
+) -> Option<Move> {
+    legal.iter().copied().find(|&m| {
+        let next = pos.play(m);
+        won_at_once(&next, attacker, is_capture(pos, m), next.in_check())
+            || lost_within(&next, attacker, tablebase, moves - 1)
+    })
+}
+
+/// Whether the defender, to move in an open position, is lost within `moves`
+/// more attacker moves: the tables give the position lost, or its every move
+/// reaches a tablebase win or a position the attacker wins from in so many.
+/// The answer is a plain truth about the position, so the replies go in any
+/// order and each is made only when the ones before have not refuted the
+/// win, which the first one usually does.
+fn lost_within(pos: &Position, attacker: Color, tablebase: Option<&Tablebase>, moves: u32) -> bool {
+    if moves == 0 {
+        return tablebase.is_some_and(|tables| lost_at_once(pos, attacker, tables));
+    }
+    if !open_but_moves(pos, attacker) {
+        return false;
+    }
+    if held_verdict(pos, tablebase) == Some(Verdict::Loss) {
+        return moves::has_legal_move(pos);
+    }
+    let mut any = false;
+    for &reply in pos.pseudo_legal().as_slice() {
+        if !pos.legal(reply) {
+            continue;
+        }
+        any = true;
+        if !wins_within(&pos.play(reply), attacker, tablebase, moves) {
+            return false;
+        }
+    }
+    // With no move, the game is over.
+    any
+}
+
+/// Whether the attacker, to move, has the game open and wins within `moves`
+/// of its moves: by the tables, at once, or into a position the defender is
+/// lost in within one move less.
+fn wins_within(pos: &Position, attacker: Color, tablebase: Option<&Tablebase>, moves: u32) -> bool {
+    if moves == 1 {
+        return wins_within_one(pos, attacker, tablebase);
+    }
+    let legal = legal_moves(pos);
+    judge(pos, attacker, &legal) == State::Open
+        && (held_verdict(pos, tablebase) == Some(Verdict::Win)
+            || win_within(pos, attacker, tablebase, moves, &legal).is_some())
+}
+
+/// `wins_within` in one move, which a short win's every line asks of its
+/// last attacker move, without the moves made: a capture that explodes the
+/// king is found from the board, and a move that neither captures nor
+/// checks wins only where the tables can come into it.
+fn wins_within_one(pos: &Position, attacker: Color, tablebase: Option<&Tablebase>) -> bool {
+    if !open_but_moves(pos, attacker) {
+        return false;
+    }
+    // A move can reach the tables, the attacker's capture and then each
+    // defence taking ten pieces off the board at most (`lost_at_once`); a
+    // plain move takes none.
+    let pieces = pos.occupied().count();
+    let tables = tablebase.filter(|tables| pieces <= tables.max_pieces() + 20);
+    let plain_tables = tables.filter(|tables| pieces <= tables.max_pieces() + 10);
+    if tables.is_some_and(|tables| pieces <= tables.max_pieces()) {
+        if !moves::has_legal_move(pos) {
+            return false;
+        }
+        if held_verdict(pos, tablebase) == Some(Verdict::Win) {
+            return true;
+        }
+    }
+    // Such a capture is legal, so the game is open.
+    if moves::exploding_capture(pos, attacker).is_some() {
+        return true;
+    }
+    let mover = Mover::new(pos);
+    pos.pseudo_legal().as_slice().iter().any(|&m| {
+        let plain = mover.plain(m);
+        if (plain && plain_tables.is_none()) || !mover.legal(m) {
+            return false;
+        }
+        let effect = mover.effect(m);
+        mover.explodes_them(&effect)
+            || (!plain && mover.gives_check(m, &effect) && !moves::has_legal_move(&pos.play(m)))
+            || tables.is_some_and(|tables| lost_at_once(&pos.play(m), attacker, tables))
+    })
+}
+
+/// Whether the defender, to move, is lost to the tables with no attacker
+/// move left: the position open and lost, or its every move a capture into
+/// a position the tables win. A move that is not such a capture, the usual
+/// first, settles it without a probe.
+fn lost_at_once(pos: &Position, attacker: Color, tables: &Tablebase) -> bool {
+    // A capture takes ten pieces off the board at most, and no other move
+    // any.
+    let pieces = pos.occupied().count();
+    if pieces > tables.max_pieces() + 10 {
+        return false;
+    }
+    if pieces > tables.max_pieces() {
+        let base = pos.child_base();
+        for &reply in pos.pseudo_legal().as_slice() {
+            if !pos.legal(reply) {
+                continue;
+            }
+            let effect = pos.effect(reply, base);
+            if !effect.capture || effect.occupied.count() > tables.max_pieces() {
+                return false;
+            }
+        }
+    }
+    let replies = legal_moves(pos);
+    if judge(pos, attacker, &replies) != State::Open {
+        return false;
+    }
+    if held_verdict(pos, Some(tables)) == Some(Verdict::Loss) {
+        return true;
+    }
+    replies.into_iter().all(|reply| {
+        let next = pos.play(reply);
+        let legal = legal_moves(&next);
+        judge(&next, attacker, &legal) == State::Open
+            && held_verdict(&next, Some(tables)) == Some(Verdict::Win)
+    })
+}
+
+/// Whether the game is open by `judge` but for its legal moves: both kings
+/// on the board, either side able to win, the 50-move limit not reached.
+fn open_but_moves(pos: &Position, attacker: Color) -> bool {
+    pos.halfmoves() < 100
+        && pos.king(!attacker).is_some()
+        && pos.king(attacker).is_some()
+        && !(moves::cannot_win(pos, Color::White) && moves::cannot_win(pos, Color::Black))
+}
+
+/// The tablebase verdict for the side to move, where a proof written with
+/// these tables allows one (`Walk::verdict`).
+fn held_verdict(pos: &Position, tablebase: Option<&Tablebase>) -> Option<Verdict> {
+    let tables = tablebase?;
+    if pos.halfmoves() != 0
+        || pos.has_castling_rights()
+        || pos.occupied().count() > tables.max_pieces()
+    {
+        return None;
+    }
+    tables.probe_held(&pos.to_atomic()).ok()
 }
 
 fn fen(pos: &Position) -> String {
@@ -398,6 +619,52 @@ pub fn walk(
     tablebase: Option<&Tablebase>,
     source: impl FnMut(&Position) -> Option<Move>,
 ) -> Result<(Header, Vec<u32>), String> {
+    walk_once(root, attacker, tablebase, source).map(|(header, indices, _)| (header, indices))
+}
+
+/// `walk` for a search's proof, whose `source` is asked for a position's
+/// shortest proof at its counter, or with `true` for the one that holds
+/// furthest (`Dfpn::proof_move`). The walk takes the shortest; if that
+/// writes some position at two counters with two moves, it walks again
+/// taking the ones that hold furthest, and fails if that still does; it
+/// tells whether the proof is the second walk's, which can be longer. A
+/// position's moves at different counters, each sound on its own lines, can
+/// together link positions in a circle, which the format forbids. A walk
+/// that ends with one move a position has none: a circle's moves are all
+/// quiet, as no capture or pawn move is undone, and each of its positions
+/// had its move last walked at the highest counter it was written at, where
+/// the next position of the circle, two plies on, was proven at that
+/// counter plus two or written at a higher one; round the circle the
+/// counters would rise without end.
+pub fn walk_search(
+    root: &Atomic,
+    attacker: Color,
+    tablebase: Option<&Tablebase>,
+    mut source: impl FnMut(&Position, bool) -> Option<Move>,
+) -> Result<(Header, Vec<u32>, bool), String> {
+    let (header, indices, mixed) = walk_once(root, attacker, tablebase, |pos| source(pos, false))?;
+    if !mixed {
+        return Ok((header, indices, false));
+    }
+    let (header, indices, mixed) = walk_once(root, attacker, tablebase, |pos| source(pos, true))?;
+    if mixed {
+        return Err(TWO_MOVES.into());
+    }
+    Ok((header, indices, true))
+}
+
+/// Why a proof is not written when even the proofs that hold furthest give
+/// some position two moves: its lines could repeat a position.
+pub const TWO_MOVES: &str = "a position is proven with two moves, and a line could repeat it";
+
+/// `walk`, and whether it wrote some position at two counters with two
+/// moves.
+fn walk_once(
+    root: &Atomic,
+    attacker: Color,
+    tablebase: Option<&Tablebase>,
+    source: impl FnMut(&Position) -> Option<Move>,
+) -> Result<(Header, Vec<u32>, bool), String> {
     let board = Position::from_atomic(root);
     let pieces = tablebase.map_or(0, Tablebase::max_pieces);
     let mut walk = Walk {
@@ -409,11 +676,13 @@ pub fn walk(
             indices: Vec::new(),
         },
         proven: HashMap::new(),
+        mixed: false,
         strategy: None,
         decided: Cell::new(0),
         line: HashSet::new(),
     };
     let length = walk.root(&board)?;
+    let mixed = walk.mixed;
     let indices = walk.chooser.indices;
     // Tables the proof never needed are not asked of its checkers.
     let header = Header {
@@ -423,7 +692,7 @@ pub fn walk(
         moves: length,
         positions: indices.len() as u64,
     };
-    Ok((header, indices))
+    Ok((header, indices, mixed))
 }
 
 /// A proof's file: its header line, then its moves in a zstd frame.
@@ -593,6 +862,7 @@ pub fn strategy(
         pieces: header.tablebases,
         chooser: FromFile { indices, next: 0 },
         proven: HashMap::new(),
+        mixed: false,
         strategy: Some(Strategy::new()),
         decided: Cell::new(0),
         line: HashSet::new(),
@@ -602,6 +872,50 @@ pub fn strategy(
         return Err("the proof does not match its header".into());
     }
     Ok((root, attacker, walk.strategy.unwrap_or_default()))
+}
+
+/// A win whose two rook positions, A (rook c7, king e8) and B (rook f7, king
+/// d8), each reach the other by a rook move and the king's only reply, and
+/// each win at once by a check and a mate. The king has d8 and e8 alone, and
+/// Black's pawn makes the tree: its move to h5 comes at the root or a move
+/// later, so White meets A and B twice, at the counters 2 and 4 and again,
+/// after its rook has gone round, at 10 and 8.
+#[cfg(test)]
+pub const CIRCLE: &str = "2Nk1N2/2R4p/3PP3/8/7P/8/8/7K b - - 0 1";
+
+/// White's move in `CIRCLE`'s win, for a position's FEN: below the counter 6
+/// A goes to B and B checks; from 6 on, and with `furthest`, as a search
+/// asked for the moves that hold furthest gives them, B goes to A and A
+/// checks. With White's king on g1 and White to move, a root for proofs of
+/// the side to move, which reaches `CIRCLE`.
+#[cfg(test)]
+pub fn circle_move(fen: &str, furthest: bool) -> Option<&'static str> {
+    let mut fields = fen.split(' ');
+    let board = fields.next()?;
+    let high = furthest || fields.nth(3)?.parse::<u32>().ok()? >= 6;
+    Some(match board {
+        "2Nk1N2/2R4p/3PP3/8/7P/8/8/6K1" => "g1h1",
+        // The king moved first, or after the pawn's single step: the check
+        // and the mate.
+        "2N1kN2/2R4p/3PP3/8/7P/8/8/7K" | "2N1kN2/2R5/3PP2p/8/7P/8/7K/8" => "c7e7",
+        // After the pawn's single step and after its double one, a king
+        // move, which tells the two ways to h5 apart.
+        "2Nk1N2/2R5/3PP2p/8/7P/8/8/7K" | "2Nk1N2/2R5/3PP3/7p/7P/8/8/7K" => "h1h2",
+        // A and B.
+        "2N1kN2/2R5/3PP3/7p/7P/8/7K/8" if high => "c7e7",
+        "2N1kN2/2R5/3PP3/7p/7P/8/7K/8" => "c7f7",
+        "2Nk1N2/5R2/3PP3/7p/7P/8/7K/8" if high => "f7c7",
+        "2Nk1N2/5R2/3PP3/7p/7P/8/7K/8" => "f7d7",
+        // The rook's way round to B: b7, a7, g7, f7.
+        "2Nk1N2/2R5/3PP3/7p/7P/8/7K/8" => "c7b7",
+        "2N1kN2/1R6/3PP3/7p/7P/8/7K/8" => "b7a7",
+        "2Nk1N2/R7/3PP3/7p/7P/8/7K/8" => "a7g7",
+        "2N1kN2/6R1/3PP3/7p/7P/8/7K/8" => "g7f7",
+        // The mates, which only proofs in JSON lines write.
+        _ if board.starts_with("2Nk1N2/4R") => "e7e8",
+        _ if board.starts_with("2N1kN2/3R") => "d7d8",
+        _ => return None,
+    })
 }
 
 /// A mate in 4, in JSON lines: a quiet knight move first, so that the
@@ -640,11 +954,73 @@ mod tests {
     use shakmaty::{Color, KnownOutcome, Outcome, Position as _, uci::UciMove, variant::Atomic};
 
     use super::{
-        SMALL, State, decode, encode_jsonl, is_capture, legal_moves, number, small_defended, state,
-        strategy, won_at_once,
+        CIRCLE, SMALL, State, circle_move, decode, encode_jsonl, fen, file, is_capture,
+        legal_moves, number, short, small_defended, state, strategy, walk, walk_once, walk_search,
+        won_at_once,
     };
-    use crate::board::{Position, from_fen};
+    use crate::board::{Move, Position, from_fen};
     use crate::search::hash;
+    use crate::tablebase::Tablebase;
+
+    fn circle(pos: &Position, furthest: bool) -> Option<Move> {
+        let uci = circle_move(&fen(pos), furthest)?;
+        legal_moves(pos)
+            .into_iter()
+            .find(|&m| UciMove::from_standard(pos.to_shakmaty(m)).to_string() == uci)
+    }
+
+    /// A position written at two counters with two moves: each line of the
+    /// walk wins, but A's first move and B's second link A to B to A, and
+    /// the checker refuses the proof. `walk_search` sees the two moves and
+    /// walks again with the moves that hold furthest, one a position, which
+    /// the checker accepts.
+    #[test]
+    fn a_search_s_walk_writes_one_move_a_position() {
+        let root: Atomic = crate::position(CIRCLE).unwrap();
+        let white = Color::White;
+        let checked = |header, indices: &[u32]| {
+            let bytes = file(header, indices).unwrap();
+            crate::check::check_proof("proof", &bytes, None)
+        };
+        let (header, indices, mixed) =
+            walk_once(&root, white, None, |pos| circle(pos, false)).unwrap();
+        assert!(mixed);
+        assert_eq!((header.moves, header.positions), (8, 12));
+        let refused = checked(&header, &indices);
+        assert_eq!(refused["valid"], false, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("a line can repeat the position"),
+            "{error}"
+        );
+
+        let (header, indices, rewritten) = walk_search(&root, white, None, circle).unwrap();
+        assert!(rewritten);
+        let (again, same, mixed) = walk_once(&root, white, None, |pos| circle(pos, true)).unwrap();
+        assert!(!mixed);
+        assert_eq!((header.moves, &indices), (again.moves, &same));
+        assert_eq!((header.moves, header.positions), (8, 11));
+        let accepted = checked(&header, &indices);
+        assert_eq!(accepted["valid"], true, "{accepted}");
+        strategy(&header, &indices, None).unwrap();
+
+        // A walk whose every position has one move is not walked again.
+        let mut asked = 0;
+        let (once, _, rewritten) = walk_search(&root, white, None, |pos, furthest| {
+            asked += 1;
+            assert!(!furthest);
+            circle(pos, true)
+        })
+        .unwrap();
+        assert_eq!((once.positions, asked, rewritten), (11, 11, false));
+        // The plain walk takes its source's moves as they come.
+        let (plain, _) = walk(&root, white, None, |pos| circle(pos, false)).unwrap();
+        assert_eq!(plain.positions, 12);
+        // A source that gives two moves even when asked for the ones that
+        // hold furthest leaves no proof.
+        let failed = walk_search(&root, white, None, |pos, _| circle(pos, false));
+        assert_eq!(failed.err().unwrap(), super::TWO_MOVES);
+    }
 
     #[test]
     fn reads_back_what_it_writes() {
@@ -659,6 +1035,42 @@ mod tests {
         assert_eq!(attacker, Color::White);
         let first = moves[&hash(&root)].unwrap();
         assert_eq!(UciMove::from_standard(first).to_string(), "g5f7");
+    }
+
+    /// A short win is worked out from the position alone, with its first
+    /// move: SMALL's win in two, a bishop move, a reply and a capture that
+    /// explodes the king, up to the last counter its three plies fit under;
+    /// after the bishop move, the one attacker move left, and after each
+    /// reply the capture. SMALL's wins in four and in three are not short.
+    #[test]
+    fn works_out_short_wins() {
+        let white = Color::White;
+        let at = |fen: &str, counter| from_fen(fen).unwrap().at_counter(counter);
+        for fen in [
+            "rnbqkb1r/1pp1n1pp/p2p4/3P1pN1/4p2P/2N5/PPP1PPP1/R1BQKB1R w KQkq - 0 1",
+            "rnb1kb1r/1ppqnNpp/p2p4/3P1p2/4p2P/2N5/PPP1PPP1/R1BQKB1R w KQkq - 2 2",
+        ] {
+            assert_eq!(short(&at(fen, 0), white, None), None, "{fen}");
+        }
+        let two = "rnb1kbnr/1ppq1Npp/p2p4/3P1pB1/4p2P/2N5/PPP1PPP1/R2QKB1R w KQkq - 4 3";
+        for counter in [0, 4, 97] {
+            let pos = at(two, counter);
+            let (length, m) = short(&pos, white, None).unwrap();
+            let m = m.unwrap();
+            let uci = UciMove::from_standard(pos.to_shakmaty(m)).to_string();
+            assert_eq!((length, uci.as_str()), (2, "g5e7"), "{counter}");
+            let after = pos.play(m);
+            assert_eq!(short(&after, white, None), Some((1, None)), "{counter}");
+            for reply in legal_moves(&after) {
+                let last = after.play(reply);
+                let (length, m) = short(&last, white, None).unwrap();
+                let over = last.play(m.unwrap());
+                assert!(length == 1 && over.king(Color::Black).is_none());
+            }
+        }
+        for counter in [98, 99] {
+            assert_eq!(short(&at(two, counter), white, None), None, "{counter}");
+        }
     }
 
     /// A proof of a win for the side not to move: the header names the
@@ -757,6 +1169,167 @@ mod tests {
                     pos = pos.play(moves[(seed >> 33) as usize % moves.len()]);
                 }
             }
+        }
+    }
+
+    /// Short wins, worked out as `short` does, against the plain search of
+    /// every line in `plainly`, over random games, for either side as the
+    /// attacker, without the tables.
+    #[test]
+    fn works_out_short_wins_as_plainly() {
+        let (positions, wins) = short_as_plainly(None, &STARTS, 3);
+        assert!(positions > 1000 && wins > 100, "{positions} {wins}");
+    }
+
+    /// `works_out_short_wins_as_plainly` with the tables, from positions of
+    /// few pieces too, where they decide; with the tables up to five pieces
+    /// in `PROVARI_TABLEBASES`:
+    /// `cargo test --release -- --ignored works_out_short_wins_with_tables`.
+    #[test]
+    #[ignore = "needs the tablebases"]
+    fn works_out_short_wins_with_tables() {
+        let path = std::env::var_os("PROVARI_TABLEBASES").expect("PROVARI_TABLEBASES");
+        let tables = Tablebase::open(std::path::Path::new(&path)).unwrap();
+        let few = [
+            "4k3/8/8/2r5/8/3P4/1N6/R3K3 w - - 0 1",
+            "1n2k3/8/8/8/8/8/5PP1/K2Q4 w - - 0 1",
+            "8/8/3kb3/8/2n5/8/2P1Q3/4K1N1 w - - 0 1",
+            "r3k3/1pp5/8/8/8/8/2PPB3/R3K2N w Qq - 0 1",
+            "2kr4/ppp5/8/8/8/8/5PPP/2R3K1 b - - 0 1",
+        ];
+        // A win in two whose last move is a capture into the tables, and
+        // then every defence: from 16 pieces with five-piece tables.
+        let reach: Position = from_fen("kN6/BR6/K7/3p4/5Q2/3NQR1p/3BRB1R/6N1 b - - 0 1").unwrap();
+        for attacker in [Color::White, Color::Black] {
+            assert_eq!(
+                short(&reach, attacker, Some(&tables)),
+                plainly::short(&reach, attacker, Some(&tables))
+            );
+        }
+        assert_eq!(short(&reach, Color::White, Some(&tables)), Some((1, None)));
+        let starts: Vec<&str> = STARTS.iter().chain(&few).copied().collect();
+        let (positions, wins) = short_as_plainly(Some(&tables), &starts, 10);
+        assert!(positions > 1000 && wins > 100, "{positions} {wins}");
+    }
+
+    const STARTS: [&str; 8] = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "rn2k2r/pp3ppp/2p5/3pP3/8/2N5/PPP2PPP/R3K2R w KQkq d6 0 1",
+        "r3k2r/1P4pp/8/2pP4/8/8/p5PP/R3K2R w KQkq c6 0 1",
+        "rnbqkbnr/ppppp1p1/5p2/7p/8/4PN2/PPPP1PPP/RNBQKB1R w KQkq - 0 1",
+        "r3k2r/8/8/3qQ3/8/8/8/R3K2R b KQkq - 0 1",
+        "8/2P5/8/3k4/8/3K4/5p2/8 w - - 0 1",
+        "rnb1kb1r/p1qppp1p/1pp5/6p1/P2P1QnP/N1P2P2/1P2P1P1/R1B1KBNR b KQkq - 1 10",
+        "r3kb1r/1p3Npp/3ppn2/p4p2/8/8/PPPPPPPP/R1BQKB1R w KQkq - 0 1",
+    ];
+
+    /// Random games from each start, `games` of them, comparing `short` with
+    /// `plainly::short` at every position for either attacker: the positions
+    /// compared, and the wins found.
+    fn short_as_plainly(
+        tables: Option<&Tablebase>,
+        starts: &[&str],
+        games: usize,
+    ) -> (usize, usize) {
+        let (mut positions, mut wins) = (0, 0);
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for start in starts {
+            for _ in 0..games {
+                let mut pos: Position = from_fen(start).unwrap();
+                for _ in 0..60 {
+                    for attacker in [Color::White, Color::Black] {
+                        let found = short(&pos, attacker, tables);
+                        assert_eq!(found, plainly::short(&pos, attacker, tables), "{start}");
+                        positions += 1;
+                        wins += usize::from(found.is_some());
+                    }
+                    let moves = legal_moves(&pos);
+                    if moves.is_empty() || state(&pos, Color::White) != State::Open {
+                        break;
+                    }
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    pos = pos.play(moves[(seed >> 33) as usize % moves.len()]);
+                }
+            }
+        }
+        (positions, wins)
+    }
+
+    /// Short wins as they were first worked out, every line played out in
+    /// full: what `short` must agree with.
+    mod plainly {
+        use shakmaty::Color;
+
+        use super::super::{
+            SHORT, State, Verdict, held_verdict, is_capture, judge, legal_moves, won_at_once,
+        };
+        use crate::board::{Move, Position};
+        use crate::tablebase::Tablebase;
+
+        pub fn short(
+            pos: &Position,
+            attacker: Color,
+            tablebase: Option<&Tablebase>,
+        ) -> Option<(u32, Option<Move>)> {
+            if pos.turn() != attacker {
+                return (0..=SHORT)
+                    .find(|&moves| lost_within(pos, attacker, tablebase, moves))
+                    .map(|moves| (moves, None));
+            }
+            let legal = legal_moves(pos);
+            if judge(pos, attacker, &legal) != State::Open {
+                return None;
+            }
+            if held_verdict(pos, tablebase) == Some(Verdict::Win) {
+                return Some((0, None));
+            }
+            (1..=SHORT).find_map(|moves| {
+                win_within(pos, attacker, tablebase, moves, &legal).map(|m| (moves, Some(m)))
+            })
+        }
+
+        fn win_within(
+            pos: &Position,
+            attacker: Color,
+            tablebase: Option<&Tablebase>,
+            moves: u32,
+            legal: &[Move],
+        ) -> Option<Move> {
+            legal.iter().copied().find(|&m| {
+                let next = pos.play(m);
+                won_at_once(&next, attacker, is_capture(pos, m), next.in_check())
+                    || lost_within(&next, attacker, tablebase, moves - 1)
+            })
+        }
+
+        fn lost_within(
+            pos: &Position,
+            attacker: Color,
+            tablebase: Option<&Tablebase>,
+            moves: u32,
+        ) -> bool {
+            if moves == 0
+                && tablebase.is_none_or(|tables| pos.occupied().count() > tables.max_pieces() + 10)
+            {
+                return false;
+            }
+            let replies = legal_moves(pos);
+            if judge(pos, attacker, &replies) != State::Open {
+                return false;
+            }
+            if held_verdict(pos, tablebase) == Some(Verdict::Loss) {
+                return true;
+            }
+            replies.into_iter().all(|reply| {
+                let next = pos.play(reply);
+                let legal = legal_moves(&next);
+                judge(&next, attacker, &legal) == State::Open
+                    && (held_verdict(&next, tablebase) == Some(Verdict::Win)
+                        || (moves > 0
+                            && win_within(&next, attacker, tablebase, moves, &legal).is_some()))
+            })
         }
     }
 

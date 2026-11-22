@@ -23,15 +23,16 @@
 //! also those it settles by a mate or a check that wins in two.
 //!
 //! `provari check PROOF... [--tablebases DIR] [--workers N] [--seconds S]
-//! [--compact-only]` prints a JSON line for each proof, in order, and exits
-//! with 1 if any is not shown valid. A valid proof's line gives the attacker
-//! positions it proves, its length and the 50-move counter up to which its
-//! root may go, worked out as `FORMAT.md` describes (for JSON lines, the
-//! root's own). `valid` is false for a proof found wrong, and null for one it
-//! cannot check: the tables it needs missing, or beyond its limits
-//! (`MOST_BYTES` a file, `MOST_POSITIONS` moves written, `MOST_PLACES`
-//! positions walked, `MOST_DEPTH` attacker moves deep, S seconds a proof).
-//! With `--compact-only` it refuses JSON lines, which a server need not read.
+//! [--memory MB] [--compact-only]` prints a JSON line for each proof, in
+//! order, and exits with 1 if any is not shown valid. A valid proof's line
+//! gives the attacker positions it proves, its length and the 50-move counter
+//! up to which its root may go, worked out as `FORMAT.md` describes (for JSON
+//! lines, the root's own). `valid` is false for a proof found wrong, and null
+//! for one it cannot check: the tables it needs missing, or beyond its limits
+//! (`MOST_BYTES` a file, `MOST_DEPTH` attacker moves deep, S seconds a proof,
+//! and `MOST_PLACES` positions walked and moves written, or `PLACES_PER_MB`
+//! for each MB of `--memory MB`, which the workers share). With
+//! `--compact-only` it refuses JSON lines, which a server need not read.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -63,14 +64,18 @@ const FIELDS: [&str; 6] = [
     "moves",
     "positions",
 ];
-/// What a proof may ask of the checker: the file's size, the header's, the
-/// moves a compact proof writes, and the attacker moves along a line.
+/// What a proof may ask of the checker: the file's size, the header's, and
+/// the attacker moves along a line.
 const MOST_BYTES: u64 = 1 << 30;
 const MOST_HEADER: usize = 4096;
-const MOST_POSITIONS: u64 = 20_000_000;
 const MOST_DEPTH: usize = 10_000;
-/// The positions a check may walk, some 1 GB for every 3 million.
+/// The positions a check may walk, and the moves a compact proof may write,
+/// unless `--memory` sets them: some 10 GB at the walk's peak.
 const MOST_PLACES: usize = 20_000_000;
+/// The positions a check may walk for each MB of `--memory`: a position takes
+/// some 270 to 440 bytes as the walk's tables grow (measured on proofs of
+/// 350,000 to 510,000), its board kept twice and its links, so 500 at most.
+const PLACES_PER_MB: usize = 2_000;
 /// The most pieces of Atomic's tables, which JSON lines do not name.
 const TABLE_PIECES: usize = 6;
 /// The highest 50-move counter of a position that is not over: one at 100
@@ -78,12 +83,25 @@ const TABLE_PIECES: usize = 6;
 const LAST: u32 = 99;
 
 /// What the command line limits a check to.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Limits {
     /// The seconds a proof's check may take.
     seconds: Option<f64>,
     /// Whether proofs in JSON lines are refused.
     compact_only: bool,
+    /// The positions a proof's walk may meet, and the moves a compact proof
+    /// may write.
+    places: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            seconds: None,
+            compact_only: false,
+            places: MOST_PLACES,
+        }
+    }
 }
 
 impl Limits {
@@ -94,8 +112,13 @@ impl Limits {
 }
 
 /// Stops a walk at its limits, looked at on its first position and every
-/// 1,024th after.
-fn within(visits: &mut u64, deadline: Option<Instant>, places: usize) -> Result<(), String> {
+/// 1,024th after: past the time allowed, or with more than `most` places.
+fn within(
+    visits: &mut u64,
+    deadline: Option<Instant>,
+    places: usize,
+    most: usize,
+) -> Result<(), String> {
     *visits += 1;
     if *visits % 1024 != 1 {
         return Ok(());
@@ -103,8 +126,8 @@ fn within(visits: &mut u64, deadline: Option<Instant>, places: usize) -> Result<
     if deadline.is_some_and(|deadline| Instant::now() > deadline) {
         return Err("cannot check: it takes longer than the time allowed".into());
     }
-    if places > MOST_PLACES {
-        return Err(format!("cannot check: more than {MOST_PLACES} positions"));
+    if places > most {
+        return Err(format!("cannot check: more than {most} positions"));
     }
     Ok(())
 }
@@ -113,15 +136,26 @@ fn within(visits: &mut u64, deadline: Option<Instant>, places: usize) -> Result<
 pub fn run(args: &[String]) -> Result<bool, String> {
     let mut proofs = Vec::new();
     let mut directory = None;
-    let mut workers = 1;
+    let mut workers: usize = 1;
+    let mut memory: Option<usize> = None;
     let mut limits = Limits::default();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
             "--tablebases" => directory = Some(PathBuf::from(value()?)),
-            "--workers" => workers = value()?.parse().map_err(|_| "bad --workers")?,
-            "--seconds" => limits.seconds = Some(value()?.parse().map_err(|_| "bad --seconds")?),
+            "--workers" => match value()?.parse() {
+                Ok(count) if count >= 1 => workers = count,
+                _ => return Err("--workers takes a number from 1".into()),
+            },
+            "--seconds" => match value()?.parse() {
+                Ok(seconds) if (0.0..=1e9).contains(&seconds) => limits.seconds = Some(seconds),
+                _ => return Err("bad --seconds".into()),
+            },
+            "--memory" => match value()?.parse() {
+                Ok(megabytes) if megabytes >= 1 => memory = Some(megabytes),
+                _ => return Err("--memory takes a number of MB from 1".into()),
+            },
             "--compact-only" => limits.compact_only = true,
             unknown if unknown.starts_with("--") => {
                 return Err(format!("unknown option {unknown}: see provari --help"));
@@ -132,15 +166,19 @@ pub fn run(args: &[String]) -> Result<bool, String> {
     if proofs.is_empty() {
         return Err(
             "usage: provari check PROOF... [--tablebases DIR] [--workers N] \
-                    [--seconds S] [--compact-only]"
+                    [--seconds S] [--memory MB] [--compact-only]"
                 .into(),
         );
+    }
+    let workers = workers.min(proofs.len()).max(1);
+    if let Some(megabytes) = memory {
+        limits.places = places_within(megabytes, workers);
     }
     let tablebase = directory.as_deref().map(open_tables).transpose()?;
     let next = AtomicUsize::new(0);
     let results = Mutex::new(vec![None; proofs.len()]);
     std::thread::scope(|scope| {
-        for _ in 0..workers.max(1) {
+        for _ in 0..workers {
             std::thread::Builder::new()
                 .stack_size(STACK)
                 .spawn_scoped(scope, || {
@@ -166,6 +204,12 @@ pub fn run(args: &[String]) -> Result<bool, String> {
         println!("{line}");
     }
     Ok(all_valid)
+}
+
+/// The places each walk may meet when the workers' walks share `megabytes`
+/// MB, at least one.
+fn places_within(megabytes: usize, workers: usize) -> usize {
+    (megabytes.saturating_mul(PLACES_PER_MB) / workers.max(1)).max(1)
 }
 
 /// The tables in a directory, or in several listed as `PATH` lists them,
@@ -248,13 +292,13 @@ fn check_bytes(
 ) -> Result<Shown, String> {
     let deadline = limits.deadline();
     if let Some((header, body)) = compact_header(bytes) {
-        return check_compact(&header, body, tablebase, deadline);
+        return check_compact(&header, body, tablebase, deadline, limits.places);
     }
     if limits.compact_only {
         return Err("not in the compact format".into());
     }
     let text = std::str::from_utf8(bytes).map_err(|_| "neither format")?;
-    check(text, tablebase, deadline)
+    check(text, tablebase, deadline, limits.places)
 }
 
 /// The header of a proof in the compact format, its first line, and the rest
@@ -270,12 +314,14 @@ fn compact_header(bytes: &[u8]) -> Option<(Value, &[u8])> {
 }
 
 /// Checks a proof in the compact format: how many attacker positions it
-/// proves, its length, and the counter up to which its root may go.
+/// proves, its length, and the counter up to which its root may go. It may
+/// write at most `most` moves and meet at most `most` places.
 fn check_compact(
     header: &Value,
     body: &[u8],
     tables: Option<&Tablebase<Atomic>>,
     deadline: Option<Instant>,
+    most: usize,
 ) -> Result<Shown, String> {
     let fields = header.as_object().ok_or("a bad header")?;
     let named = usize::from(fields.contains_key("attacker"));
@@ -311,10 +357,8 @@ fn check_compact(
         number("moves")?,
         number("positions")?,
     );
-    if positions > MOST_POSITIONS {
-        return Err(format!(
-            "cannot check: more than {MOST_POSITIONS} moves written"
-        ));
+    if positions > most as u64 {
+        return Err(format!("cannot check: more than {most} moves written"));
     }
     let tablebase = match pieces {
         0 => None,
@@ -341,6 +385,7 @@ fn check_compact(
         depth: 0,
         won: 0,
         deadline,
+        most,
         visits: 0,
     };
     let (length, counter) = walker.root(&root)?;
@@ -426,11 +471,13 @@ fn number(m: Move) -> u32 {
 }
 
 /// Checks a proof: how many attacker positions it wins, its length, and the
-/// root's own counter, as its moves are given by position and counter.
+/// root's own counter, as its moves are given by position and counter. It
+/// may meet at most `most` places.
 fn check(
     text: &str,
     tablebase: Option<&Tablebase<Atomic>>,
     deadline: Option<Instant>,
+    most: usize,
 ) -> Result<Shown, String> {
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let header: Value = serde_json::from_str(lines.next().ok_or("an empty proof")?)
@@ -445,6 +492,7 @@ fn check(
         won: HashSet::new(),
         edges: Vec::new(),
         deadline,
+        most,
         visits: 0,
         depth: 0,
     };
@@ -526,6 +574,8 @@ struct Checker<'a> {
     /// position only through a cycle here.
     edges: Vec<Vec<u32>>,
     deadline: Option<Instant>,
+    /// The most places the check may meet.
+    most: usize,
     visits: u64,
     /// The attacker moves of the line being walked.
     depth: usize,
@@ -598,7 +648,12 @@ impl Checker<'_> {
         if self.won.contains(&key) {
             return Ok(());
         }
-        within(&mut self.visits, self.deadline, self.places.len())?;
+        within(
+            &mut self.visits,
+            self.deadline,
+            self.places.len(),
+            self.most,
+        )?;
         if self.verdict(pos) == Some(Wdl::Win) {
             self.won.insert(key);
             return Ok(());
@@ -757,6 +812,8 @@ struct Walker<'a> {
     /// The attacker positions proven.
     won: usize,
     deadline: Option<Instant>,
+    /// The most places the check may meet.
+    most: usize,
     visits: u64,
 }
 
@@ -869,7 +926,12 @@ impl Walker<'_> {
         {
             return Ok((length, holds));
         }
-        within(&mut self.visits, self.deadline, self.places.len())?;
+        within(
+            &mut self.visits,
+            self.deadline,
+            self.places.len(),
+            self.most,
+        )?;
         if !self.line.insert(id) {
             return Err(format!("a line repeats {}", fen(pos)));
         }
@@ -1069,7 +1131,8 @@ mod tests {
         assert_eq!(compact_verdict(&compact()).map(|(_, length)| length), Ok(4));
         // The same proof in JSON lines.
         assert_eq!(
-            check(crate::format::SMALL, None, None).map(|(_, length, _)| length),
+            check(crate::format::SMALL, None, None, super::MOST_PLACES)
+                .map(|(_, length, _)| length),
             Ok(json!(4))
         );
     }
@@ -1152,7 +1215,7 @@ mod tests {
         for clock in [0, 97] {
             let text = proof(clock).join("\n");
             assert_eq!(
-                check(&text, None, None).map(|(.., counter)| counter),
+                check(&text, None, None, super::MOST_PLACES).map(|(.., counter)| counter),
                 Ok(clock)
             );
         }
@@ -1230,7 +1293,7 @@ mod tests {
     fn keeps_to_its_limits() {
         let at_once = Limits {
             seconds: Some(0.0),
-            compact_only: false,
+            ..Limits::default()
         };
         let error = check_bytes(&compact(), None, at_once).unwrap_err();
         assert!(
@@ -1238,11 +1301,37 @@ mod tests {
             "{error}"
         );
         let compact_only = Limits {
-            seconds: None,
             compact_only: true,
+            ..Limits::default()
         };
         let error = check_bytes(crate::format::SMALL.as_bytes(), None, compact_only).unwrap_err();
         assert_eq!(error, "not in the compact format");
+        // The places a walk may meet, and the moves a compact proof may
+        // write: the small proof writes 6, and in JSON lines it names 6
+        // positions, all met before the walk's first look.
+        let places = |places| Limits {
+            places,
+            ..Limits::default()
+        };
+        let error = check_bytes(&compact(), None, places(5)).unwrap_err();
+        assert_eq!(error, "cannot check: more than 5 moves written");
+        assert!(check_bytes(&compact(), None, places(6)).is_ok());
+        let small = crate::format::SMALL.as_bytes();
+        let error = check_bytes(small, None, places(5)).unwrap_err();
+        assert_eq!(error, "cannot check: more than 5 positions");
+        assert!(check_bytes(small, None, places(6)).is_ok());
+        // Looked at on a walk's first position and every 1,024th after.
+        let mut visits = 0;
+        assert!(super::within(&mut visits, None, 3, 2).is_err());
+        assert!(super::within(&mut visits, None, 3, 2).is_ok());
+        let mut visits = 1023;
+        assert!(super::within(&mut visits, None, 3, 2).is_ok());
+        assert!(super::within(&mut visits, None, 3, 2).is_err());
+        // `--memory` gives 2,000 places a MB, shared among the workers.
+        assert_eq!(super::places_within(10_000, 1), 20_000_000);
+        assert_eq!(super::places_within(56_000, 4), 28_000_000);
+        assert_eq!(super::places_within(1, 4_000), 1);
+        assert_eq!(super::places_within(usize::MAX, 1), usize::MAX);
         // A small frame that would fill far more than its header's moves
         // can: the checker reads only as far as they could reach.
         let (mut header, _) = parts(&compact());
@@ -1349,6 +1438,7 @@ mod tests {
             let limits = Limits {
                 seconds: Some(10.0),
                 compact_only: true,
+                ..Limits::default()
             };
             // Each walk in a thread with the stack it has in use.
             let (checked, read) = std::thread::scope(|scope| {
@@ -1444,7 +1534,7 @@ mod tests {
     }
 
     fn verdict(lines: &[String]) -> Result<usize, String> {
-        check(&lines.join("\n"), None, None).map(|(won, ..)| won)
+        check(&lines.join("\n"), None, None, super::MOST_PLACES).map(|(won, ..)| won)
     }
 
     #[test]
@@ -1502,7 +1592,13 @@ mod tests {
                 verdict(&lines),
                 Err(format!("cannot check: needs the tablebases for {settled}"))
             );
-            let error = check(&lines.join("\n"), Some(&Tablebase::new()), None).unwrap_err();
+            let error = check(
+                &lines.join("\n"),
+                Some(&Tablebase::new()),
+                None,
+                super::MOST_PLACES,
+            )
+            .unwrap_err();
             let start = format!("cannot check: no tablebase verdict for {settled}: ");
             assert!(error.starts_with(&start), "{error}");
         }
@@ -1557,6 +1653,7 @@ mod tests {
             won: HashSet::new(),
             edges: Vec::new(),
             deadline: None,
+            most: super::MOST_PLACES,
             visits: 0,
             depth: 0,
         };
@@ -1606,6 +1703,20 @@ mod tests {
             super::run(&args),
             Err("unknown option --tablebase: see provari --help".to_owned())
         );
+    }
+
+    #[test]
+    fn refuses_invalid_seconds_and_workers() {
+        for args in [
+            ["proof.pvr", "--seconds", "-1"].as_slice(),
+            &["proof.pvr", "--seconds", "NaN"],
+            &["proof.pvr", "--seconds", "inf"],
+            &["proof.pvr", "--seconds", "2e9"],
+            &["proof.pvr", "--workers", "0"],
+        ] {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(super::run(&args).is_err(), "accepted {args:?}");
+        }
     }
 
     /// The module's code, before its tests, names no path into the rest of

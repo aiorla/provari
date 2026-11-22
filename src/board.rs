@@ -23,7 +23,8 @@ pub struct Move(u16);
 const NORMAL: u16 = 0;
 const EN_PASSANT: u16 = 1;
 const CASTLE: u16 = 2;
-/// Promotions to the knight, bishop, rook, and queen follow.
+/// Promotions to the knight, bishop, rook, and queen follow, and in
+/// Antichess to the king.
 const PROMOTION: u16 = 3;
 
 impl Move {
@@ -33,6 +34,20 @@ impl Move {
 
     fn promoting(from: Square, to: Square, role: Role) -> Move {
         Move::new(from, to, PROMOTION + role as u16 - Role::Knight as u16)
+    }
+
+    /// A move that neither takes en passant, castles nor promotes.
+    pub fn normal(from: Square, to: Square) -> Move {
+        Move::new(from, to, NORMAL)
+    }
+
+    pub fn en_passant(from: Square, to: Square) -> Move {
+        Move::new(from, to, EN_PASSANT)
+    }
+
+    /// A promotion to `role`, a knight up to a king.
+    pub fn promote(from: Square, to: Square, role: Role) -> Move {
+        Move::promoting(from, to, role)
     }
 
     /// The move's bits, 15 at most and never 0: no move goes from a square to
@@ -539,6 +554,14 @@ impl Position {
         passed.turn = !self.turn;
         passed.halfmoves = self.halfmoves + 1;
         passed
+    }
+
+    /// The position at another 50-move counter, for tests.
+    #[cfg(test)]
+    pub fn at_counter(&self, counter: u32) -> Position {
+        let mut at = self.clone();
+        at.halfmoves = counter;
+        at
     }
 
     /// The hash every child's hash starts from: this one for the other side

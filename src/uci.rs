@@ -659,11 +659,10 @@ impl Report<'_> {
     /// longest line against its moves.
     fn describe(&self, search: &Dfpn) -> Result<Win, String> {
         let tables = if self.exact { None } else { self.tables };
-        let (header, indices) = format::walk(self.root, self.attacker, tables, |pos| {
-            search
-                .winning_move(&pos.to_atomic(), &(pos.hash(), pos.halfmoves()))
-                .and_then(|m| format::board_move(pos, &m))
-        })?;
+        let (header, indices, _) =
+            format::walk_search(self.root, self.attacker, tables, |pos, furthest| {
+                search.proof_move(pos, furthest)
+            })?;
         let (_, _, moves) = format::strategy(&header, &indices, tables)?;
         let (mut line, _) =
             lines::Proof::new(self.attacker, moves).longest_line(self.root, tables)?;
@@ -672,8 +671,9 @@ impl Report<'_> {
             // the defender, who loses whatever it plays, any.
             line.extend(if self.root.turn() == self.attacker {
                 let pos = board::Position::from_atomic(self.root);
-                walk::winning_capture(self.root, self.attacker)
-                    .or_else(|| search.winning_move(self.root, &(pos.hash(), pos.halfmoves())))
+                walk::winning_capture(self.root, self.attacker).or_else(|| {
+                    search.winning_move(self.root, &(pos.hash(), pos.halfmoves()), false)
+                })
             } else {
                 self.root.legal_moves().first().copied()
             });

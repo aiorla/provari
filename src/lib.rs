@@ -1,7 +1,9 @@
 //! provari's library: the search, its board and network, the proof format,
-//! a proof's walk and the checker. The command line (`main.rs`) and the browser
+//! a proof's walk, its refinement and the checker. The command line (`main.rs`) and the browser
 //! build (`web`, for WebAssembly) are made from it.
 
+#[cfg(feature = "antichess")]
+pub mod antichess;
 pub mod board;
 pub mod check;
 pub mod clock;
@@ -14,9 +16,12 @@ pub mod moves;
 pub mod nnue;
 pub mod pause;
 pub mod proofs;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod refine;
 pub mod search;
 pub mod table;
 pub mod tablebase;
+pub mod variant;
 pub mod walk;
 #[cfg(target_arch = "wasm32")]
 pub mod web;

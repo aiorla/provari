@@ -242,9 +242,17 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
             .ok_or("bad attacker")?,
     };
     let nodes = request["nodes"].as_u64();
-    let seconds = request["seconds"]
-        .as_f64()
-        .unwrap_or(if nodes.is_some() { 3.2e7 } else { 10.0 });
+    let seconds = match request["seconds"].as_f64() {
+        Some(seconds) if (0.0..=1e9).contains(&seconds) => seconds,
+        Some(_) => return Err("bad seconds".into()),
+        None => {
+            if nodes.is_some() {
+                3.2e7
+            } else {
+                10.0
+            }
+        }
+    };
     let memory = usize::try_from(request["memory_mb"].as_u64().unwrap_or(256))
         .map_err(|_| "bad memory_mb")?;
     let most = match request["most"].as_u64() {
@@ -282,6 +290,9 @@ fn search(state: &mut State, request: &Value) -> Result<Value, String> {
         search.set_most(most);
     }
     if let Some(every) = request["progress"].as_f64() {
+        if !(0.0..=1e9).contains(&every) {
+            return Err("bad progress".into());
+        }
         search.set_progress_sink(
             Duration::from_secs_f64(every),
             Box::new(|line| {
@@ -387,7 +398,9 @@ fn proof_file(
     attacker: Color,
     tables: Option<&Tablebase>,
 ) -> Result<(format::Header, Vec<u8>), String> {
-    let (header, indices) = format::walk(root, attacker, tables, |pos| search.proof_move(pos))?;
+    let (header, indices, _) = format::walk_search(root, attacker, tables, |pos, furthest| {
+        search.proof_move(pos, furthest)
+    })?;
     let file = format::file(&header, &indices)?;
     Ok((header, file))
 }

@@ -125,6 +125,15 @@ impl Table {
         })
     }
 
+    /// Forgets every entry, as a new table of the same size.
+    pub fn clear(&mut self) {
+        zero(&mut self.clusters);
+        zero(&mut self.filter.words);
+        *self.filter.set.get_mut() = 0;
+        *self.inserted.get_mut() = 0;
+        *self.filtering.get_mut() = true;
+    }
+
     /// Starts loading the cluster a position would be in, so that a lookup
     /// soon after does not wait for memory.
     pub fn prefetch(&self, hash: u64) {
@@ -301,11 +310,12 @@ impl Table {
     }
 
     /// Rebuilds the filter from the table and the positions held elsewhere,
-    /// at most `held` of them, and reads it if it comes out sparse. A dropped
-    /// filter is rebuilt only if it may: a quarter of its bits set takes
-    /// about 0.29 positions a bit, and a large table holds far more. Shared,
-    /// only while the other threads wait. Returns whether the filter is read.
-    pub fn rebuild_filter(&self, elsewhere: impl Iterator<Item = u64>, held: usize) -> bool {
+    /// given by their checks (`check`), at most `held` of them, and reads it
+    /// if it comes out sparse. A dropped filter is rebuilt only if it may: a
+    /// quarter of its bits set takes about 0.29 positions a bit, and a large
+    /// table holds far more. Shared, only while the other threads wait.
+    /// Returns whether the filter is read.
+    pub fn rebuild_filter(&self, elsewhere: impl Iterator<Item = u32>, held: usize) -> bool {
         self.inserted.store(0, Relaxed);
         let positions = self.fill() * (self.clusters.len() * 4) as f64 + held as f64;
         if !self.filtering() && positions > 0.29 * self.filter.bits() as f64 {
@@ -320,8 +330,8 @@ impl Table {
                 }
             }
         }
-        for hash in elsewhere {
-            self.filter.insert(check(hash));
+        for check in elsewhere {
+            self.filter.insert(check);
         }
         let sparse = self.filter.set.load(Relaxed) * 4 <= self.filter.bits();
         self.filtering.store(sparse, Relaxed);
@@ -426,6 +436,12 @@ pub fn large<T: Zeroed>(count: usize) -> Result<Vec<T>, TryReserveError> {
         values.set_len(count);
     }
     Ok(values)
+}
+
+/// Sets every value back to its default, zero.
+pub fn zero<T: Zeroed>(values: &mut [T]) {
+    // SAFETY: zeros are the default value of `T`.
+    unsafe { values.as_mut_ptr().write_bytes(0, values.len()) }
 }
 
 /// Asks Linux to back the whole huge pages inside these bytes with huge
@@ -544,7 +560,7 @@ impl Filter {
 
 #[cfg(test)]
 mod tests {
-    use super::{Known, Table};
+    use super::{Known, Table, check};
 
     /// A hash whose check bits, and so whose filter bit, are `check`.
     fn hash(check: u64) -> u64 {
@@ -696,7 +712,9 @@ mod tests {
             assert!(!table.filtering());
             // Few: the filter holds the table's position and the one elsewhere.
             let elsewhere = hash(5);
-            assert!(table.rebuild_filter(std::iter::once(elsewhere), 1) && table.filtering());
+            assert!(
+                table.rebuild_filter(std::iter::once(check(elsewhere)), 1) && table.filtering()
+            );
             assert!(table.may_hold(held, true) && table.may_hold(elsewhere, true));
             assert!(!table.may_hold(hash(1 << 19), true) && !table.may_hold(hash(4), true));
         }

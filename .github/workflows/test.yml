@@ -1,6 +1,7 @@
 # Checks and tests provari on Linux, macOS and Windows, with the network and
-# the model that data/fetch.sh fetches (from where the repository variable
-# PROVARI_NETWORKS says, if set).
+# the model that data/fetch.sh fetches, and Atomic-Stockfish's network for the
+# tests of its format (from where the repository variable PROVARI_NETWORKS
+# says, if set).
 name: test
 on: [push, pull_request]
 env:
@@ -18,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup update --no-self-update stable
-      - run: sh data/fetch.sh
+      - run: sh data/fetch.sh --legacy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo clippy --all-targets --features bundled --locked -- -D warnings

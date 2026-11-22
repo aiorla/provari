@@ -283,22 +283,27 @@ pub fn status(pos: &Atomic, attacker: Color) -> Status {
 /// the win reaches with the move a search recorded for it, or none for a
 /// tablebase win, in the order a checker meets them; except where a capture
 /// wins at once (an explosion of the king, as a rule), which the checkers find
-/// for themselves. Returns how many positions it handed over.
+/// for themselves. Returns how many positions it handed over, and whether
+/// some position had two moves at two counters, which together can link
+/// positions in a circle (`format::walk_search`).
 pub fn read_proof(
     root: &Atomic,
     tablebase: Option<&Tablebase>,
     mut winning_move: impl FnMut(&Atomic, &Key) -> Option<Move>,
     mut emit: impl FnMut(&Atomic, Option<Move>) -> Result<(), String>,
-) -> Result<usize, String> {
+) -> Result<(usize, bool), String> {
     let attacker = root.turn();
     match status(root, attacker) {
-        Status::Won => return Ok(0),
+        Status::Won => return Ok((0, false)),
         Status::Over => return Err("the root has ended without the attacker winning".into()),
         Status::Open => {}
     }
     let probe = |pos: &Atomic| tablebase.and_then(|tables| tables.probe(pos));
     let mut count = 0;
     let mut seen = HashSet::new();
+    // Each position's move, without its counter.
+    let mut moves: HashMap<u64, Move> = HashMap::new();
+    let mut mixed = false;
     let mut pending = vec![root.clone()];
     while let Some(pos) = pending.pop() {
         let key = key(&pos);
@@ -317,6 +322,7 @@ pub fn read_proof(
             let fen = Fen::from_position(&pos, EnPassantMode::Legal);
             format!("no winning move recorded for {fen}")
         })?;
+        mixed |= moves.insert(key.0, m).is_some_and(|before| before != m);
         emit(&pos, Some(m))?;
         count += 1;
         let mut after = pos.clone();
@@ -333,7 +339,7 @@ pub fn read_proof(
             }
         }
     }
-    Ok(count)
+    Ok((count, mixed))
 }
 
 /// Whether a capture wins at once, as the checkers look for one: an explosion
@@ -371,8 +377,12 @@ fn defender_order(legal: MoveList) -> Vec<Move> {
 #[cfg(test)]
 mod tests {
     use super::{Search, read_proof};
-    use shakmaty::variant::Atomic;
+    use shakmaty::{EnPassantMode, fen::Fen, uci::UciMove, variant::Atomic};
     use std::time::{Duration, Instant};
+
+    fn fen(pos: &Atomic) -> String {
+        Fen::from_position(pos, EnPassantMode::Legal).to_string()
+    }
 
     #[test]
     fn a_root_draw_precedes_a_capture_that_would_win() {
@@ -393,5 +403,44 @@ mod tests {
             let proof = read_proof(&root, None, winning_move, |_, _| Ok(()));
             assert_eq!(proof.is_ok(), clock == 99);
         }
+    }
+
+    /// `format::CIRCLE`'s win from White's move: with each position's move
+    /// at its counter, two positions have two moves, which a proof in JSON
+    /// lines cannot hold either; with the moves that hold furthest, none.
+    #[test]
+    fn tells_a_position_with_two_moves() {
+        let root = crate::position("2Nk1N2/2R4p/3PP3/8/7P/8/8/6K1 w - - 0 1").unwrap();
+        let read = |furthest: bool| {
+            let mut lines = vec![serde_json::json!({ "root": fen(&root), "moves": 9 }).to_string()];
+            let result = read_proof(
+                &root,
+                None,
+                |pos, _| {
+                    let uci = crate::format::circle_move(&fen(pos), furthest)?;
+                    uci.parse::<UciMove>().ok()?.to_move(pos).ok()
+                },
+                |pos, m| {
+                    let m = UciMove::from_standard(m.unwrap()).to_string();
+                    lines.push(serde_json::json!({ "fen": fen(pos), "move": m }).to_string());
+                    Ok(())
+                },
+            );
+            let proof = lines.join("\n");
+            (
+                result,
+                crate::check::check_proof("proof", proof.as_bytes(), None),
+            )
+        };
+        let (mixed, checked) = read(false);
+        assert_eq!(mixed, Ok((17, true)));
+        let error = checked["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("a line can repeat the position"),
+            "{error}"
+        );
+        let (single, checked) = read(true);
+        assert_eq!(single, Ok((16, false)));
+        assert_eq!(checked["valid"], true, "{checked}");
     }
 }

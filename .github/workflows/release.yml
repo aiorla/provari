@@ -56,11 +56,11 @@ jobs:
             echo "needs the C runtime's DLLs" >&2
             exit 1
           fi
-      - name: Package the binary with the license, the guide and the format
+      - name: Package the binary with the license, the README, the guide and the format
         run: |
           name=provari-$GITHUB_REF_NAME-${{ matrix.platform }}
           mkdir "$name"
-          cp LICENSE README.md FORMAT.md "$name"/
+          cp LICENSE README.md USAGE.md FORMAT.md "$name"/
           if [ "$RUNNER_OS" = Windows ]; then
             cp target/release/provari.exe "$name"/
             "$name"/provari.exe --version | grep "built in"
